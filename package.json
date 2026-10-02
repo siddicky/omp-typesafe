@@ -5,7 +5,10 @@
   "license": "MIT",
   "author": "Abdullah Siddique",
   "type": "module",
-  "repository": "github:siddicky/omp-typesafe",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siddicky/omp-typesafe.git"
+  },
   "homepage": "https://github.com/siddicky/omp-typesafe#readme",
   "keywords": [
     "omp",
