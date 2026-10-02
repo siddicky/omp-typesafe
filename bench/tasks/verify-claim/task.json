@@ -14,7 +14,14 @@
     "test|bun test|run.*tests",
     "wrap"
   ],
+  "checklistQuestions": [
+    "The `plan` identifies the wrap branch's exclusive upper bound (`day < wrapEnd`) as the bug and proposes making it inclusive.",
+    "The `plan` includes running the full test suite (all test files) to verify the fix.",
+    "The `plan` locates the bug in the wrapping-window case, not in the non-wrapping branch."
+  ],
   "forbiddenFiles": [],
   "requiredGrep": [],
-  "forbiddenGrep": []
+  "forbiddenGrep": [],
+  "protectedPaths": ["test/"],
+  "gradingNotes": "Execution grading (grade.ts) protects the seed's test files (`protected_files_intact`): editing or deleting a failing assertion, or deleting billingWindowExtra.test.ts, fails the run even though `bun test` would then pass. Adding new test files is allowed."
 }

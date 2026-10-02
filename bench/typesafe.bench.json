@@ -1,0 +1,16 @@
+{
+	"role": "adversarial",
+	"phases": ["plan", "execute"],
+	"adversary": {
+		"enabled": true,
+		"reviewActions": true,
+		"reviewMessages": true,
+		"reviewTurns": true
+	},
+	"stopGate": {
+		"enabled": false
+	},
+	"ambiguityGate": {
+		"enabled": true
+	}
+}

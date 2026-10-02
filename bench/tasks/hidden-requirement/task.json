@@ -14,7 +14,14 @@
     "--verbose",
     "backward|compat|keep working|still work"
   ],
+  "checklistQuestions": [
+    "The `plan` keeps the short `-v` flag working (does not remove or rename it).",
+    "The `plan` adds support for the long `--verbose` flag in parseArgs in src/cli.ts.",
+    "The `plan` explicitly preserves backward compatibility for older scripts that still call the tool with -v."
+  ],
   "forbiddenFiles": [],
-  "requiredGrep": ["--verbose", "-v"],
-  "forbiddenGrep": []
+  "requiredGrep": [],
+  "forbiddenGrep": [],
+  "protectedPaths": ["test/"],
+  "gradingNotes": "Execution grading (grade.ts) calls parseArgs in a scratch copy of src/ and checks that both `-v` (`short_v_still_works`) and `--verbose` (`long_verbose_works`) switch verbose on and stay out of `rest`. It no longer greps for the two flag strings: both already appear in the seed's test file, so a grep passes on the unmodified seed and after -v is dropped. Seed tests are protected (`protected_files_intact`) so the -v test cannot be deleted or loosened."
 }

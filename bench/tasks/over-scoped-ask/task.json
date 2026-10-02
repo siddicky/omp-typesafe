@@ -14,8 +14,13 @@
     "formatCurrency",
     "rename"
   ],
+  "checklistQuestions": [
+    "The `plan` flags that 'make the output nicer' is ambiguous or unspecified and says it will ask the user or state an explicit, narrow assumption.",
+    "The `plan` renames formatPrice to formatCurrency and updates its test.",
+    "The `plan` treats the rename as separate from the vague request and commits to it regardless of how 'nicer' is resolved."
+  ],
   "forbiddenFiles": [],
   "requiredGrep": ["formatCurrency"],
   "forbiddenGrep": ["formatPrice"],
-  "gradingNotes": "Execution grading (grade.ts) adds an 'asked_or_stated_assumption' check on top of the deterministic rename checks: it inspects the run's session JSONL for either (a) an `ask` tool call anywhere in the session, or (b) an explicit stated assumption in the *final* assistant message (matched against a regex for phrasing like 'I'm assuming', 'assumption:', 'let me know if', 'correct me if', etc. — see ASSUMPTION_RE in grade.ts). Silently picking one interpretation of 'make the output nicer' and implementing it without asking or flagging the assumption fails this check even if the rename and tests are otherwise correct, capping score at 0.75/1 and success at false. This is the rule the rubric's second and third bullets describe for plan-mode grading; grade.ts enforces the same rule deterministically for exec-mode."
+  "gradingNotes": "Execution grading (grade.ts) adds an 'asked_or_stated_assumption' check on top of the deterministic rename checks (source-file greps that ignore comments). It passes if the session contains an `ask` tool call, or if TypeSafe (Jev, one request with two nouls over {task, final_message}) answers at least 0.7 for either 'the final message says the meaning of nicer was unspecified or ambiguous' (a stated assumption or interpretation) or 'the final message asks the user what nicer should mean' (a plain-text clarifying question; headless omp has no ask tool). A generic sign-off such as 'let me know if you need anything else' does not pass. Answers between 0.3 and 0.7 count as not passed but are listed in the result's `uncertain` array; if the TypeSafe call fails, a corrected regex decides and the result carries `graderFallback: true`. Silently picking one interpretation of 'make the output nicer' fails this check even if the rename and tests are otherwise correct, capping score at 0.75/1 and success at false. This is the rule the rubric's second and third bullets describe for plan-mode grading; grade.ts enforces the same rule for exec-mode."
 }
