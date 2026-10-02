@@ -18,6 +18,9 @@ the agent to keep going. For users of the [omp-skills](https://github.com/siddic
 
 It also registers a `typesafe_ask` tool exposing all three TypeSafe primitives (noul, choice, score) for direct use.
 
+Separately, once a session's context is large, it can cut stale tool output out of what each model request sends, scored
+by Jev: see [Context compaction](#context-compaction).
+
 Everything the reviewer judges is sent to TypeSafe's API, including parts of your transcript and diffs. Read
 [What leaves your machine](#what-leaves-your-machine) before turning it on for a sensitive repo.
 
@@ -297,6 +300,37 @@ reason. It runs at most twice per prompt, never chains onto its own continuation
 out of plan mode and of setups whose `phases` lack `execute`. It also needs the reviewer enabled, so
 `adversary.enabled: false`, `TYPESAFE_REVIEW_ENABLED=0` and `/adversary off` turn it off too.
 
+## Context compaction
+
+A long session sends every old tool output with every model request. With `compaction.enabled` (on by default, and only
+with a `TYPESAFE_API_KEY`), the extension asks Jev, before a request whose context is at least `compaction.minChars`
+characters (150,000), whether each tool call and each tool result in the history is still needed. A result Jev gives less
+than `compaction.keepThreshold` (0.2) is cut to its first 300 characters plus a note naming a file under
+`<agent dir>/jev-spill/` that holds the whole output, which the agent reads back with `read` (`compaction.spill: false`
+skips the file, and the cut is then final for that request). Nothing is summarized or rewritten: user and assistant text,
+thinking blocks, every tool call, and the newest `compaction.preserveRecent` messages (6) go through as omp built them.
+Only that one request changes: omp's `context` event replaces the messages of a single request, so the session on disk is
+untouched and a wrong judgement costs one turn.
+
+Rewriting the start of a conversation invalidates the provider's prompt cache, so decisions are remembered. With
+`compaction.sticky` (on), the same tool-call-id to replacement map is re-applied on later requests and the covered part
+comes back byte-identical. The context is scored again only once it has grown by `compaction.rewriteGrowth` (0.4) and
+`minRequestsBetweenRewrites` (15) requests have passed, or after `maxRequestsBetweenRewrites` (40) whatever the growth. With
+`sticky: false` every request is scored again, except that a session whose last request was at least `cacheCeiling` (0.8)
+cache reads is left alone: rewriting it would turn a cheap cached request into a full-price one.
+
+What it sends to TypeSafe is listed in [What leaves your machine](#what-leaves-your-machine) and is masked by
+`adversary.redact`. The spill files are not masked: they hold the tool output as it was, readable by you only (mode 600 in
+a mode 700 directory), and nothing prunes them. A failure (an API error, a timeout, a malformed answer) leaves that request
+unreduced and is logged as `[typesafe] context compaction failed`. It does not run in subagent sessions (see
+[Subagents](#subagents)). Switch it off with `compaction.enabled: false`.
+
+It is a port of [omp-jev-compaction](https://github.com/jerryfane/omp-jev-compaction) (MIT) onto this extension's client and
+config. The scoring core is vendored under `src/vendor/fast-jev/` from
+[fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction) (MIT), at the commit named in its `UPSTREAM_COMMIT`.
+Of upstream's two integration points only the per-request one is ported: its `session_before_compact` path declined in live
+sessions, because omp had already pruned the region by then.
+
 ## Pipeline (omp-skills)
 
 [omp-skills](https://github.com/siddicky/omp-skills) turns a vague request into parallel, critic-gated work in three
@@ -539,6 +573,19 @@ profile (absent file = defaults):
     "skills": ["deep-interview", "ralplan", "dag"],
     "specChecks": true,
     "approvalGuard": false
+  },
+  "compaction": {
+    "enabled": true,
+    "keepThreshold": 0.2,
+    "minChars": 150000,
+    "spill": true,
+    "preserveRecent": 6,
+    "sticky": true,
+    "rewriteGrowth": 0.4,
+    "minRequestsBetweenRewrites": 15,
+    "maxRequestsBetweenRewrites": 40,
+    "cacheCeiling": 0.8,
+    "timeoutMs": 10000
   }
 }
 ```
@@ -563,10 +610,11 @@ profile (absent file = defaults):
 | `ambiguityGate.*` | See [Ambiguity gate](#ambiguity-gate-plan-mode). The gate is eligible only while fewer than `maxAsksPerPlan` answers have been observed, so `0` keeps it silent. |
 | `pipeline.planGuard`, `skillAware`, `specChecks`, `approvalGuard` | One switch per [pipeline feature](#pipeline-omp-skills). Two of them can block a tool call: `planGuard`, which is on by default (with or without omp-skills installed; see [Plan guard](#plan-guard)), and `approvalGuard`, which is off. |
 | `pipeline.skills` | Skill names `skillAware` treats as pipeline skills. Case-sensitive, trimmed, each kept once. A bare name also matches that skill under any namespace (`dag` matches `omp-skills/dag`); a `<namespace>/<name>` entry matches only that one. `[]` recognizes none. An absent key, a non-array, or a list with nothing usable falls back to the default. |
+| `compaction.*` | See [Context compaction](#context-compaction). `keepThreshold` and `cacheCeiling` are 0 to 1, `rewriteGrowth` 0 to 10, `timeoutMs` 250 to 60000 per request to Jev (no retries). |
 
 Numeric values are clamped to their valid ranges, and unknown or mistyped values fall back to the default.
-If `typesafe.json` exists but cannot be read or parsed, the config fails closed: the reviewer, the stop gate and
-the ambiguity gate are all off until the file parses, and a warning says why. The pipeline features cost nothing and
+If `typesafe.json` exists but cannot be read or parsed, the config fails closed: the reviewer, the stop gate, the
+ambiguity gate and context compaction are all off until the file parses, and a warning says why. The pipeline features cost nothing and
 keep their defaults. Config warnings (repairs, rejected
 environment values, a failed load) are shown as a notice at session start and on each session switch, and in
 `/adversary status`.
@@ -583,7 +631,7 @@ unrecognized value is ignored with a warning.
 |---|---|
 | `TYPESAFE_API_KEY` | Required for any Jev call. Read by the SDK. |
 | `TYPESAFE_CONFIG` | An alternate config file path, read instead of `<agent dir>/typesafe.json`. |
-| `PI_CODING_AGENT_DIR` | omp's active profile directory. Moves `typesafe.json`, the user-level priority files and the `/adversary dump` location. |
+| `PI_CODING_AGENT_DIR` | omp's active profile directory. Moves `typesafe.json`, the user-level priority files, the `/adversary dump` location and the compaction spill directory. |
 | `TYPESAFE_ROLE` | `"advisory"` or `"adversarial"`; overrides `role`. |
 | `TYPESAFE_REVIEW_ENABLED` | Sets `adversary.enabled`. Also turns the stop gate off when false. |
 | `TYPESAFE_AMBIGUITY_GATE` | Sets `ambiguityGate.enabled`. |
@@ -623,6 +671,7 @@ each capped:
 | Evidence | `git status` (1000), `--stat` (800), up to 3 file diffs (2000 each), for up to 5 removed names the matching `git grep` hits (10 per name, 200 chars each, from any tracked or untracked file except `.omp/pipeline`, unless `pipeline.skillAware` is off), the commands run, and what is `incomplete` |
 | Ambiguity gate | The plan's first prompt (4000), the plan text so far (6000, including the plan being submitted), the questions asked and answers received, typed replies that answered no question (up to 8, 400 chars each), `git status`, and a repo outline of top-level directory and root file names |
 | Stop gate | The task, priorities and the final assistant message (2000) |
+| Context compaction | The conversation, in windows of about 60,000 characters: user and assistant text (abridged when a window is large; the goal is your last 3 prompts, 500 chars each), each tool call's name and input (1000 chars at most, less when a window is large), and for each result its status and size, never its output |
 | `typesafe_ask`, `/typesafe test` | Whatever state the model passes and the text of its questions (instructions, option and rubric descriptions), and a fixed probe |
 
 The [pipeline features](#pipeline-omp-skills) are not in this table: they make no request. The spec check reads the spec
@@ -674,6 +723,12 @@ Local history scans defer formatting tool-call previews, captured write content 
 reads them. Metadata hooks therefore avoid repeating display work for old calls without changing the rendered
 evidence, its limits or the masking rules.
 
+Context compaction costs about $0.0006 per window of about 15,000 tokens at that price, and runs only when a request's
+context reaches `compaction.minChars`. Each request to Jev uses `compaction.timeoutMs` with no retries, and one rewrite stops
+after 25 s in all, inside omp's 30 s cap on an extension handler. A pass that fails leaves that request unreduced and
+remembers nothing, so the next request tries again: with the API down, every request over `minChars` first waits up to
+`compaction.timeoutMs`. `compaction.enabled: false` stops that.
+
 ## Development
 
 ```sh
@@ -707,7 +762,7 @@ and a value schema.
 
 Tests live in `test/`:
 
-- one file per module (`config`, `client`, `branch`, `evidence`, `text`, `priorities`, `ambiguity`, `reviewer`), and
+- one file per module (`config`, `client`, `branch`, `evidence`, `text`, `priorities`, `ambiguity`, `reviewer`, `compaction`), and
   `test/pipeline/` one per pipeline module (`plan-guard`, `skill`, `spec`, `approval`);
 - `test/index.test.ts` drives the real extension factory through a fake `ExtensionAPI` in the order omp really
   emits events (session lifecycle, plan-mode detection, delivery, gate, pipeline guards, budgets, redaction). It runs a private
@@ -729,6 +784,7 @@ src/reviewer.ts    role-aware batteries, severity derivation, emission guard, bu
 src/evidence.ts    git probes via pi.exec, missed-callsite grep, commands-run, repo outline
 src/branch.ts      session-branch scanner (camelCase roles), plan-mode detection, plan text, skill-prompt turns
 src/client.ts      @typesafe-ai/sdk wrapper: usage tracking, timeouts, error classification
+src/compaction.ts  verbatim context reduction: omp message mapping, Jev scoring windows, sticky decisions, spill, cache guard
 src/config.ts      defaults, <agent dir>/typesafe.json, validation, env overrides
 src/priorities.ts  ADVERSARY.md (adversarial) / WATCHDOG.md (advisory) discovery and budget
 src/text.ts        text helpers: capping, escaping, secret redaction
@@ -737,6 +793,7 @@ src/pipeline/plan-guard.ts  plan guard: blocks run_dag/prepare_dag eval cells in
 src/pipeline/skill.ts       skill prompts: parses the expanded and the raw /skill: shapes, tells pipeline skills
 src/pipeline/spec.ts        deep-interview spec checks: tolerant parser, user-quote corpus, <pipeline-check> note
 src/pipeline/approval.ts    approval guard: approval flips, ask-answer evidence, block or would-block decision
+src/vendor/fast-jev/        Jev scoring core vendored from tamaratran/fast-jev-compaction (MIT); UPSTREAM_COMMIT names the commit
 
 test/              bun test suites (src modules, index wiring, bench harness) with no network
 bench/             benchmark harness; see bench/README.md

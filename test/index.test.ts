@@ -4092,3 +4092,110 @@ describe("pipeline (omp-skills)", () => {
 		expect(await status(none)).toContain("skill-aware on (no skills)");
 	});
 });
+
+// ---- context compaction -----------------------------------------------------------------------
+
+describe("context compaction", () => {
+	// The messages of one request, in the shape the host sends: a large tool result that Jev scores and drops.
+	const RESULT_TEXT = "L".repeat(2_000);
+	const contextMessages = (): Record<string, unknown>[] => [
+		{ role: "user", content: [{ type: "text", text: "read the log and find the failing test" }] },
+		{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "reading" },
+				{ type: "toolCall", id: "c1", name: "read", arguments: { path: "big.log" } },
+			],
+		},
+		{ role: "toolResult", toolCallId: "c1", toolName: "read", content: [{ type: "text", text: RESULT_TEXT }] },
+		{ role: "assistant", content: [{ type: "text", text: "the failing test is parsePort" }] },
+	];
+	const compactionCfg = { adversary: { enabled: false }, compaction: { minChars: 100, preserveRecent: 0 } };
+	const jevAnswers = { call_t1: { type: "noul", noul: 0 }, result_t1: { type: "noul", noul: 0 } };
+
+	/** `ctx` for a subagent's session, with `agent` defined the way omp defines it (not enumerable). */
+	function subCtx(h: Harness): Record<string, unknown> {
+		const copy: Record<string, unknown> = { ...h.ctx, sessionManager: { getBranch: () => [userMsg("sub task")], getSessionId: () => "sub-ctx-1" } };
+		Object.defineProperty(copy, "agent", { value: { kind: "sub", id: "CtxAgent", name: "task", depth: 1, parentId: "Main" }, enumerable: false });
+		return copy;
+	}
+
+	test("a context over minChars gets its dropped tool result replaced, and the session branch is untouched", async () => {
+		const h = setup(compactionCfg, [userMsg("go")]);
+		await h.start();
+		replies.other = jevAnswers;
+		const out = await h.fire("context", { messages: contextMessages() });
+
+		expect(out?.messages).toBeDefined();
+		expect(out.messages).toHaveLength(4);
+		const replaced = out.messages.find((m: { role: string }) => m.role === "toolResult");
+		expect(replaced.content[0].text).toContain("[jev elided");
+		expect(replaced.content[0].text).toContain(join(agent, "jev-spill"));
+		// The scored conversation went through the mocked client, once per question.
+		expect(mockState.calls).toHaveLength(1);
+		expect(Object.keys(mockState.calls[0].questions).sort()).toEqual(["call_t1", "result_t1"]);
+		// Only what this request sends changes; the session on disk is never touched.
+		expect(h.branch).toEqual([userMsg("go")]);
+	});
+
+	test("no API key: the context is returned untouched and nothing is scored", async () => {
+		mockState.apiKey = false;
+		const h = setup(compactionCfg, [userMsg("go")]);
+		await h.start();
+		const out = await h.fire("context", { messages: contextMessages() });
+		expect(out).toBeUndefined();
+		expect(mockState.calls).toHaveLength(0);
+	});
+
+	test("compaction.enabled false: nothing happens", async () => {
+		const h = setup({ adversary: { enabled: false }, compaction: { enabled: false, minChars: 100, preserveRecent: 0 } }, [userMsg("go")]);
+		await h.start();
+		const out = await h.fire("context", { messages: contextMessages() });
+		expect(out).toBeUndefined();
+		expect(mockState.calls).toHaveLength(0);
+	});
+
+	test("a subagent session's context is never reduced", async () => {
+		const h = setup(compactionCfg, [userMsg("go")]);
+		await h.start();
+		const out = await h.fire("context", { messages: contextMessages() }, subCtx(h));
+		expect(out).toBeUndefined();
+		expect(mockState.calls).toHaveLength(0);
+	});
+
+	test("a scoring failure logs and leaves the request alone", async () => {
+		const h = setup(compactionCfg, [userMsg("go")]);
+		await h.start();
+		mockState.respond = () => {
+			throw new Error("jev down");
+		};
+		const out = await h.fire("context", { messages: contextMessages() });
+		expect(out).toBeUndefined();
+		expect(h.warns).toHaveLength(1);
+		expect(h.warns[0]).toContain("[typesafe] context compaction failed");
+		expect(h.warns[0]).toContain("jev down");
+	});
+
+	test("session_switch drops the sticky state: the next large context is scored again", async () => {
+		const h = setup(compactionCfg, [userMsg("go")]);
+		await h.start();
+		replies.other = jevAnswers;
+		const messages = contextMessages();
+
+		const first = await h.fire("context", { messages });
+		expect(first?.messages).toBeDefined();
+		const asksAfterFirst = mockState.calls.length;
+		expect(asksAfterFirst).toBeGreaterThan(0);
+
+		// Sticky: the same request is answered from the recorded decisions, without a new ask.
+		const second = await h.fire("context", { messages });
+		expect(mockState.calls).toHaveLength(asksAfterFirst);
+		expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+
+		await h.fire("session_switch");
+		const third = await h.fire("context", { messages });
+		expect(mockState.calls.length).toBe(2 * asksAfterFirst);
+		expect(third?.messages).toBeDefined();
+		expect(JSON.stringify(third)).toBe(JSON.stringify(first));
+	});
+});
