@@ -13,7 +13,8 @@ Delivery (which channel a note goes out on, when it steers, dedupe, budgets) is 
 the question battery and note wording differ. Review notes are advice: they never block a tool call. Two other
 pieces can intervene, and both are described below: the [ambiguity gate](#ambiguity-gate-plan-mode) can refuse
 a plan submission in plan mode until the user has been asked, and the optional [stop gate](#stop-gate) can ask
-the agent to keep going.
+the agent to keep going. For users of the [omp-skills](https://github.com/siddicky/omp-skills) pipeline, four local
+[pipeline features](#pipeline-omp-skills) make no Jev call; two of them can block a specific kind of tool call.
 
 It also registers a `typesafe_ask` tool exposing all three TypeSafe primitives (noul, choice, score) for direct use.
 
@@ -110,7 +111,8 @@ outside the phases you enabled.
 - **What counts as a change.** `git status` plus a diff against `HEAD`, so staged, unstaged and untracked files
   all show up. HEAD is captured at the start of each prompt, so a commit the agent makes mid-prompt is still
   diffed; an unborn branch diffs against the empty tree. The file the reviewed action edited is diffed first.
-  Lock files, minified bundles and source maps never take a diff slot.
+  Lock files, minified bundles and source maps never take a diff slot. The [omp-skills](#pipeline-omp-skills) runner's
+  state under `.omp/pipeline` is left out of every probe, unless `pipeline.skillAware` is `false`.
 - **Missed-callsite probe.** Names whose definition was removed or renamed in the diff (function, class,
   interface, type, enum and `const` declarations, exports, methods) are searched with
   `git grep -w -F --untracked`; surviving references show up in the note as `identifier → path:line`. Reading
@@ -295,6 +297,139 @@ reason. It runs at most twice per prompt, never chains onto its own continuation
 out of plan mode and of setups whose `phases` lack `execute`. It also needs the reviewer enabled, so
 `adversary.enabled: false`, `TYPESAFE_REVIEW_ENABLED=0` and `/adversary off` turn it off too.
 
+## Pipeline (omp-skills)
+
+[omp-skills](https://github.com/siddicky/omp-skills) turns a vague request into parallel, critic-gated work in three
+skills: `deep-interview` writes a spec (`.omp/pipeline/specs/<slug>.md`), `ralplan` a PRD (`.omp/pipeline/prd.json`), and
+`dag` runs that PRD from a Python `eval` cell (`run_dag()`, `agent()`). Four features here know about it. None of them
+calls Jev, none sends anything off the machine, and none needs `TYPESAFE_API_KEY`: they read the session branch, the tool
+call, and for the spec check the spec file on disk. None of them approves, writes or runs anything on your behalf.
+`/adversary status` has a `pipeline guards` and a `pipeline checks` line showing which are on and what they did.
+
+| Feature | Config key | Default | Acts on |
+|---|---|---|---|
+| [Plan guard](#plan-guard) | `pipeline.planGuard`, env `TYPESAFE_PIPELINE_GUARD` | on | `tool_call` for `eval` |
+| [Skill awareness](#skill-awareness) | `pipeline.skillAware`, `pipeline.skills` | on; `deep-interview`, `ralplan`, `dag` | `before_agent_start`, `turn_end`, `tool_call`, git evidence |
+| [Spec checks](#spec-checks) | `pipeline.specChecks` | on | `tool_result` for `write`, `edit`, `apply_patch` |
+| [Approval guard](#approval-guard) | `pipeline.approvalGuard` | **off** | `tool_call` for `write`, `edit`, `apply_patch`, `eval` |
+
+All of them are dormant in [subagent sessions](#subagents), and each one fails open: an error, an unreadable file or an
+input it does not recognize means the call goes ahead. The two guards are the only ones that can block a tool call; the
+reason they return is what the model sees as the tool's error. They are not part of the reviewer: `/adversary off`
+leaves them as they are, and each has its own config key.
+
+### Plan guard
+
+In plan mode, `dag`'s workers are read-only: no `write`, `bash` or `eval`, so every node that has to change a file ends
+`blocked`. `dag` cannot tell that it is in plan mode (its skill only asks the model to check), and `eval` stays available
+there, so a cell that calls `run_dag(` or `prepare_dag(` would run and fail. With `pipeline.planGuard` such a cell is
+blocked while plan mode is active, before anything starts, with the reason
+
+```
+run_dag() cannot run in plan mode: dag workers are read-only there (no write, bash or eval), so every node would end blocked. Nothing was run. Ask the user to leave plan mode (Shift+Tab or /plan), then re-run the cell. Do not retry before they have.
+```
+
+- **Plan mode** is detected as the [ambiguity gate](#ambiguity-gate-plan-mode) detects it: the latest signal on the
+  branch wins. Under `--plan-yolo` the `plan-mode-context` message marks it, so the guard applies there too.
+- **A call** is `run_dag(` or `prepare_dag(` in running Python code, with or without a receiver, and inside an f-string
+  field. The name in a comment, a string, a docstring or literal f-string text does not count, nor does a longer name
+  (`my_run_dag(`), a bare reference (`partial(run_dag, ...)`), an import, or a `def`. A call through a computed name
+  (`globals()["run_dag"](...)`) is not seen. Cells in another language never match.
+- **On by default, whether or not omp-skills is installed.** The guard does not look for the skills: it reads the cell. In
+  plan mode it blocks any Python `eval` cell that calls `run_dag(` or `prepare_dag(`, including a function of that name
+  from your own code or another library, and a block is a failed tool call the model has to work around. The skills are
+  not a precondition. To turn it off, set `"pipeline": { "planGuard": false }` in `typesafe.json`.
+- **Kill switch.** `TYPESAFE_PIPELINE_GUARD=0` (also `false`, `off`, `no`) turns it off without touching the config
+  file; it wins over `pipeline.planGuard`.
+
+### Skill awareness
+
+A `/skill:<name> args` prompt reaches the extension in one of two shapes: omp expands it into the skill's whole text
+(`[IMPORTANT: User invoked the "dag" skill ...`, the body, a footer, `User: args`) in the TUI and over RPC, and passes the
+raw `/skill:<name> args` in print mode. The expanded one is recorded in the session as a `skill-prompt` custom message
+and not as a user message. Without this feature the skill's whole text would be scored as the plan's task, and a skill you
+ran would be no turn of yours for any review. With `pipeline.skillAware`:
+
+- **The gate stays silent** for a prompt that runs one of `pipeline.skills` (default `deep-interview`, `ralplan`, `dag`;
+  names as omp writes them: a bare name matches that skill under any namespace too, which is how omp writes a name two
+  providers share (`omp-skills/dag`), and a `<namespace>/<name>` entry matches only that one). The skill runs its own interview and gates:
+  there is no `plan_start` score, no `<ambiguity-gate>` note and no propose block for that prompt, and the gate resumes
+  with the next prompt that is not a pipeline skill. If the skill was the plan's first prompt, what you typed besides the
+  skill token is the plan's objective (with nothing typed, your first message after it is).
+- **A skill you invoked is your turn, and the task is what you typed.** This holds for every skill, not only the pipeline
+  ones, and it is read from the `args` the session records for the invocation (`details.args` of its `skill-prompt`
+  entry), never from the expanded skill text. Reviews, the stop gate and the gate use it as the task, and the transcript
+  delta shows `USER: <that>`. A skill invoked with nothing typed besides its token has said nothing: it is no turn, the
+  task stays your last real message, and the gate has nothing to score until you write something. A skill a subagent
+  loaded on its own is nobody's prompt and is ignored.
+- **The evidence leaves `.omp/pipeline` out.** The runner's and the critic's state (specs, the PRD, DAG state) is not
+  your change, so the `git status`, diff and grep probes skip that directory at any depth.
+
+`pipeline.skills: []` recognizes no skill, so the gate is never silent for one. `pipeline.skillAware: false` turns the
+whole feature off and restores the extension as it was without it, for every path:
+
+- the prompt is not read, so a skill's whole text is scored as the plan's task, as it was before, and the gate is never
+  silent for a pipeline skill;
+- a skill invocation is no turn of yours: the task of a review, of the stop gate and of the gate stays your last plain
+  message (`args` are never used), and the transcript delta has no `USER` line for it;
+- `.omp/pipeline` stays in the evidence.
+
+The [spec check](#spec-checks) has its own switch and still counts a skill's `args` as something you said.
+
+### Spec checks
+
+When a `write`, `edit` or `apply_patch` to `.omp/pipeline/specs/<slug>.md` succeeds, the file is read from disk and
+checked while its line 1 is not an approval:
+
+- line 1 is `<!-- UNAPPROVED DRAFT -->`, and the header names a challenge mode, the threshold and the final ambiguity;
+- the goal, fact base, locked decisions and unconfirmed assumptions are there, and `## Acceptance criteria` and
+  `## Work units` are H2 headings with something under them (`None` will do for the work units, not for the criteria);
+- every locked decision carries a quote (`(round N, "...")`), and the quote appears in what you said this session: your
+  messages, the arguments and raw prompt of a skill you invoked, and your answers to `ask` (what you picked, typed or
+  noted). Case, whitespace, curly versus straight quotes and `...` gaps are ignored; what the model said is never a source.
+
+Problems go to the model as one note, once per spec content: a rewrite that changes nothing says nothing again, and a
+fixed spec says nothing at all. It is sent as an aside (`deliverAs: "aside"`), which omp injects at the next step
+boundary of the running turn. A write is always followed by a model step, so the note reaches the model before it asks
+you to approve the spec; `nextTurn` would hold it until your next prompt, after the ask. That is deliberate, and it is
+the [reviewer's rule](#delivery) for notes after a tool result: an aside is used only where a model step is guaranteed to follow.
+
+```
+<pipeline-check spec=".omp/pipeline/specs/rate-limit.md" problems="1" guidance="advisory; weigh, don't blindly obey">
+...fix the file before you ask the user to approve it...
+- line 12: could not verify the quote in anything the user said this session: "every route"
+</pipeline-check>
+```
+
+It is advice: a quote that cannot be verified may predate a compaction, so the note asks the model to confirm it or move
+the decision under the unconfirmed assumptions. It never blocks anything, edits the tool result or calls Jev, works in
+headless runs, and is independent of `/adversary off` (`pipeline.specChecks: false` turns it off). A file that is not
+recognizably a spec, an approved spec, and a table-shaped locked-decisions section are left alone. Notes are custom
+messages of type `ai.typesafe.pipeline`.
+
+### Approval guard
+
+Off by default, because it blocks. What authorizes `ralplan`'s and `dag`'s unattended work is an approval the skills ask
+for with `ask` and record as a flag, and the only thing that keeps the model from granting it to itself is the skills'
+own wording. With `pipeline.approvalGuard` this extension also checks. A `write`, `edit` or `apply_patch` that
+
+- sets a spec's line 1 to `<!-- APPROVED ... -->`, or
+- sets `"approved": true` in `.omp/pipeline/prd.json` or `.omp/pipeline/dag/*.json`,
+
+and an `eval` cell that calls `approve_file(`, is blocked unless the branch holds your answer to an `ask` that came after
+the latest draft write of that same file. That answer must be exactly **Approve** (**Run** for DAG state, whose gate
+offers Edit, Run and Cancel): one option picked, nothing typed under "Other", not a default omp picked when the question
+timed out, and not a question with a single option. A cancelled or failed `ask` never counts. The reason is
+`Approval needs the user's exact Approve answer from the ask tool.`
+
+- **Headless** runs have no `ask` tool, so nothing is blocked: the flip is recorded as `would block` (a log line, and the
+  count in `/adversary status`).
+- **It never approves anything.** It only refuses a flip that has no answer behind it.
+- **Not a sandbox.** It guards against honest mistakes. A `bash` command such as `sed -i`, or an `eval` cell that writes
+  the marker or the flag itself, is not seen, and neither is a subagent's write. A compaction that drops the answer from
+  the branch makes the next flip a block, and the model asks again. An `ask` result in a shape it does not recognize
+  lets the flip through.
+
 ## Subagents
 
 omp runs this extension's factory again in every subagent session (the `task` tool, an eval `agent()`, a DAG
@@ -338,7 +473,8 @@ Without that:
   - `role` overrides `role`/`TYPESAFE_ROLE` for the rest of the session and reloads that role's priorities.
   - `status` reports the resolved role, tools (or `none`), model and last resolved model, API key and client
     errors, delivery and suppression counts, usage and estimated cost, the gate's last score, the
-    [subagent guard](#subagents) and how many subagent sessions it skipped, and config warnings.
+    [subagent guard](#subagents) and how many subagent sessions it skipped, the [pipeline](#pipeline-omp-skills) features
+    (on or off, what each blocked or sent), and config warnings.
   - `dump` writes the review history to `adversary-<session id>.json` in the `logs` folder beside the agent
     directory when that directory is named `agent` (`~/.omp/agent` gives `~/.omp/logs`), and in `<agent dir>/logs`
     otherwise. A failure is reported as an error notice.
@@ -396,6 +532,13 @@ profile (absent file = defaults):
     "maxAsksPerPlan": 3,
     "blockPropose": true,
     "timeoutMs": 2500
+  },
+  "pipeline": {
+    "planGuard": true,
+    "skillAware": true,
+    "skills": ["deep-interview", "ralplan", "dag"],
+    "specChecks": true,
+    "approvalGuard": false
   }
 }
 ```
@@ -418,10 +561,13 @@ profile (absent file = defaults):
 | `adversary.timeoutMs` | Per review, with no retries. |
 | `stopGate.*` | See [Stop gate](#stop-gate). |
 | `ambiguityGate.*` | See [Ambiguity gate](#ambiguity-gate-plan-mode). The gate is eligible only while fewer than `maxAsksPerPlan` answers have been observed, so `0` keeps it silent. |
+| `pipeline.planGuard`, `skillAware`, `specChecks`, `approvalGuard` | One switch per [pipeline feature](#pipeline-omp-skills). Two of them can block a tool call: `planGuard`, which is on by default (with or without omp-skills installed; see [Plan guard](#plan-guard)), and `approvalGuard`, which is off. |
+| `pipeline.skills` | Skill names `skillAware` treats as pipeline skills. Case-sensitive, trimmed, each kept once. A bare name also matches that skill under any namespace (`dag` matches `omp-skills/dag`); a `<namespace>/<name>` entry matches only that one. `[]` recognizes none. An absent key, a non-array, or a list with nothing usable falls back to the default. |
 
 Numeric values are clamped to their valid ranges, and unknown or mistyped values fall back to the default.
 If `typesafe.json` exists but cannot be read or parsed, the config fails closed: the reviewer, the stop gate and
-the ambiguity gate are all off until the file parses, and a warning says why. Config warnings (repairs, rejected
+the ambiguity gate are all off until the file parses, and a warning says why. The pipeline features cost nothing and
+keep their defaults. Config warnings (repairs, rejected
 environment values, a failed load) are shown as a notice at session start and on each session switch, and in
 `/adversary status`.
 
@@ -442,6 +588,7 @@ unrecognized value is ignored with a warning.
 | `TYPESAFE_REVIEW_ENABLED` | Sets `adversary.enabled`. Also turns the stop gate off when false. |
 | `TYPESAFE_AMBIGUITY_GATE` | Sets `ambiguityGate.enabled`. |
 | `TYPESAFE_AMBIGUITY_THRESHOLD` | A number from 0 to 1; overrides `ambiguityGate.threshold`. Anything else is ignored with a warning. |
+| `TYPESAFE_PIPELINE_GUARD` | Sets `pipeline.planGuard`: `0`, `false`, `off` or `no` is the kill switch for the [plan guard](#plan-guard), which blocks `run_dag(` in plan mode. |
 | `TYPESAFE_DEFAULT_MODEL` | Model to use when the config file sets none. |
 | `TYPESAFE_BASE_URL` | API root for the SDK. Default `https://api.typesafe.ai`. |
 | `TYPESAFE_LOG_LEVEL` | Ignored by this extension: the SDK client is pinned to `warn` so a stray `debug` cannot print request bodies. SDK output goes to omp's logger. |
@@ -470,13 +617,16 @@ each capped:
 
 | Request | Content sent |
 |---|---|
-| Action review | The task (last user message, 1200 chars), your priorities file text (2000), the tool name and input (3000), the tool result (2000), the exit status, the agent's last claim (800), the previous 3 tool results, and evidence |
+| Action review | The task (last user turn, 1200 chars: your message, or, with `pipeline.skillAware`, what you typed after a `/skill:` token), your priorities file text (2000), the tool name and input (3000), the tool result (2000), the exit status, the agent's last claim (800), the previous 3 tool results, and evidence |
 | Message review | The task, priorities, the assistant message (4000), the last 5 actions |
 | Turn review | The task, priorities, the transcript delta since the last review (6000: user and assistant text, tool-call previews, result first lines), and evidence |
-| Evidence | `git status` (1000), `--stat` (800), up to 3 file diffs (2000 each), for up to 5 removed names the matching `git grep` hits (10 per name, 200 chars each, from any tracked or untracked file), the commands run, and what is `incomplete` |
+| Evidence | `git status` (1000), `--stat` (800), up to 3 file diffs (2000 each), for up to 5 removed names the matching `git grep` hits (10 per name, 200 chars each, from any tracked or untracked file except `.omp/pipeline`, unless `pipeline.skillAware` is off), the commands run, and what is `incomplete` |
 | Ambiguity gate | The plan's first prompt (4000), the plan text so far (6000, including the plan being submitted), the questions asked and answers received, typed replies that answered no question (up to 8, 400 chars each), `git status`, and a repo outline of top-level directory and root file names |
 | Stop gate | The task, priorities and the final assistant message (2000) |
 | `typesafe_ask`, `/typesafe test` | Whatever state the model passes and the text of its questions (instructions, option and rubric descriptions), and a fixed probe |
+
+The [pipeline features](#pipeline-omp-skills) are not in this table: they make no request. The spec check reads the spec
+file on disk, and the guards read the branch and the tool call, all in this process.
 
 So if the agent runs `cat .env`, edits a config holding a key, or prints a token in a test log, that text is in the
 tool result or diff that reaches TypeSafe. Two mitigations apply:
@@ -547,9 +697,10 @@ and a value schema.
 
 Tests live in `test/`:
 
-- one file per module (`config`, `client`, `branch`, `evidence`, `text`, `priorities`, `ambiguity`, `reviewer`);
+- one file per module (`config`, `client`, `branch`, `evidence`, `text`, `priorities`, `ambiguity`, `reviewer`), and
+  `test/pipeline/` one per pipeline module (`plan-guard`, `skill`, `spec`, `approval`);
 - `test/index.test.ts` drives the real extension factory through a fake `ExtensionAPI` in the order omp really
-  emits events (session lifecycle, plan-mode detection, delivery, gate, budgets, redaction). It runs a private
+  emits events (session lifecycle, plan-mode detection, delivery, gate, pipeline guards, budgets, redaction). It runs a private
   copy of `src/` with its own mocked client, because Bun applies `mock.module` across test files;
 - `test/unused-imports.test.ts` fails when a file under `src/`, `test/` or `bench/` imports a name it does not use
   (`tsc --noUnusedLocals` cannot be turned on for the whole project: `test/host-compat.ts` declares assertion
@@ -566,11 +717,17 @@ src/subagent.ts    subagent guard: tells a subagent's session from the main one,
 src/ambiguity.ts   plan-mode ambiguity gate: battery, composite math, question templates, decisions, telemetry
 src/reviewer.ts    role-aware batteries, severity derivation, emission guard, budgets, delivery routing
 src/evidence.ts    git probes via pi.exec, missed-callsite grep, commands-run, repo outline
-src/branch.ts      session-branch scanner (camelCase roles), plan-mode detection, plan text
+src/branch.ts      session-branch scanner (camelCase roles), plan-mode detection, plan text, skill-prompt turns
 src/client.ts      @typesafe-ai/sdk wrapper: usage tracking, timeouts, error classification
 src/config.ts      defaults, <agent dir>/typesafe.json, validation, env overrides
 src/priorities.ts  ADVERSARY.md (adversarial) / WATCHDOG.md (advisory) discovery and budget
 src/text.ts        text helpers: capping, escaping, secret redaction
+
+src/pipeline/plan-guard.ts  plan guard: blocks run_dag/prepare_dag eval cells in plan mode (Python-aware call finder)
+src/pipeline/skill.ts       skill prompts: parses the expanded and the raw /skill: shapes, tells pipeline skills
+src/pipeline/spec.ts        deep-interview spec checks: tolerant parser, user-quote corpus, <pipeline-check> note
+src/pipeline/approval.ts    approval guard: approval flips, ask-answer evidence, block or would-block decision
+
 test/              bun test suites (src modules, index wiring, bench harness) with no network
 bench/             benchmark harness; see bench/README.md
 assets/            starter ADVERSARY.md and WATCHDOG.md

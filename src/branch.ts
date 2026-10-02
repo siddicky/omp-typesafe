@@ -35,6 +35,26 @@ export interface MessageView {
 	toolCallId: string | null;
 	isError: boolean;
 	toolCalls: ToolCallView[];
+	/**
+	 * `ask` tool results only: omp's structured answer (`selectedOptions`, `customInput`, `note`, `results[]`), as recorded
+	 * and not copied; undefined for every other message. The pipeline checks read what the user picked or typed from it.
+	 */
+	details?: unknown;
+}
+
+/**
+ * What omp records about a skill run: `custom_message` entries of customType `skill-prompt`, which carry the skill
+ * and what the user typed in `details`. A `/skill:<name> args` invocation is one of these, not a `user` message.
+ */
+export interface SkillPromptView {
+	/** `details.name`: the skill that ran. */
+	name: string;
+	/** `details.args`: what the user typed besides the skill token; "" when there was nothing. */
+	args: string;
+	/** `details.prompt`: the text as submitted, token in place; "" when omp did not record it. */
+	prompt: string;
+	/** A user invoked the skill, as opposed to a subagent's hidden autoload of it (agent-attributed, no args or prompt). */
+	user: boolean;
 }
 
 export interface EntryView {
@@ -44,11 +64,16 @@ export interface EntryView {
 	customType: string | null;
 	content: string;
 	message: MessageView | null;
+	/** `skill-prompt` `custom_message` entries only: the skill that ran and what the user typed. */
+	skill: SkillPromptView | null;
 	/** `mode_change` entries only: the mode entered (`plan`, `none`, `plan_paused`, ...). */
 	mode: string | null;
 	/** `mode_change` entries only: `data.planFilePath`, when omp recorded one. */
 	planFilePath: string | null;
 }
+
+/** customType of the `custom_message` omp records for a skill run (a `/skill:` invocation, or a subagent's autoload). */
+export const SKILL_PROMPT_TYPE = "skill-prompt";
 
 /** Cap on a captured `write` payload; enough for a plan file without keeping whole source files. */
 const WRITE_CONTENT_CAP = 8000;
@@ -88,6 +113,7 @@ function scanToolCall(block: Record<string, unknown>): ToolCallView {
 
 function scanMessage(raw: Record<string, unknown>): MessageView {
 	const role = typeof raw.role === "string" ? raw.role : "";
+	const toolName = typeof raw.toolName === "string" ? raw.toolName : null;
 	let text = "";
 	const toolCalls: ToolCallView[] = [];
 	if (Array.isArray(raw.content)) {
@@ -103,11 +129,22 @@ function scanMessage(raw: Record<string, unknown>): MessageView {
 	return {
 		role,
 		text,
-		toolName: typeof raw.toolName === "string" ? raw.toolName : null,
+		toolName,
 		toolCallId: typeof raw.toolCallId === "string" ? raw.toolCallId : null,
 		isError: raw.isError === true,
 		toolCalls,
+		details: role === "toolResult" && toolName === "ask" ? raw.details : undefined,
 	};
+}
+
+function scanSkillPrompt(raw: Record<string, unknown>): SkillPromptView | null {
+	const details = isRecord(raw.details) ? raw.details : null;
+	const name = stringField(details, "name");
+	if (name === null) return null;
+	// A user's invocation is attributed `user` and shown; an entry without attribution (older omp) counts as the user's
+	// unless it is hidden, which is how a subagent's autoload is recorded.
+	const user = typeof raw.attribution === "string" ? raw.attribution === "user" : raw.display !== false;
+	return { name, args: stringField(details, "args")?.trim() ?? "", prompt: stringField(details, "prompt")?.trim() ?? "", user };
 }
 
 /** Validate and project raw branch entries into a stable view. */
@@ -123,6 +160,7 @@ export function scanBranch(branch: unknown): EntryView[] {
 			customType: typeof raw.customType === "string" ? raw.customType : null,
 			content: typeof raw.content === "string" ? raw.content : "",
 			message: type === "message" && isRecord(raw.message) ? scanMessage(raw.message) : null,
+			skill: type === "custom_message" && raw.customType === SKILL_PROMPT_TYPE ? scanSkillPrompt(raw) : null,
 			mode: type === "mode_change" && typeof raw.mode === "string" ? raw.mode : null,
 			planFilePath: type === "mode_change" ? stringField(isRecord(raw.data) ? raw.data : null, "planFilePath") : null,
 		};
@@ -147,13 +185,26 @@ function previewOf(call: ToolCallView, redact: boolean): string {
  * cut can never leave the front half of one (maskedCap).
  */
 
-/** Most recent non-empty user message text (oldest-to-newest scan backwards). */
-export function lastUserText(entries: EntryView[], max = 1200, redact = false): string {
+/**
+ * The text of a user turn, or "" when the entry is not one (or is blank): a user message's text and, with `skillTurns`, for a
+ * skill the user invoked, what they typed besides the skill token (`args`). omp records a `/skill:` invocation as a
+ * `skill-prompt` custom message, never as a user message; its `content` is the whole expanded skill body, which is not what the
+ * user said. A skill invoked with nothing typed besides its token has no words of the user's: it is no turn, so the task stays
+ * the last thing they did say, not the bare `/skill:name` (`details.prompt`).
+ *
+ * `skillTurns` is `pipeline.skillAware`. Without it (the default) only a user message is a turn, as it was before the pipeline
+ * features: a skill invocation is then no user turn at all, whatever its entry holds.
+ */
+export function userTurnText(e: EntryView, skillTurns = false): string {
+	const text = e.type === "message" && e.message?.role === "user" ? e.message.text : skillTurns && e.skill?.user ? e.skill.args : "";
+	return text.trim().length > 0 ? text : "";
+}
+
+/** Most recent non-empty user turn's text (oldest-to-newest scan backwards): a user message, or with `skillTurns` a skill invocation too. */
+export function lastUserText(entries: EntryView[], max = 1200, redact = false, skillTurns = false): string {
 	for (let i = entries.length - 1; i >= 0; i--) {
-		const e = entries[i];
-		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) {
-			return maskedCap(e.message.text, max, redact);
-		}
+		const text = userTurnText(entries[i], skillTurns);
+		if (text !== "") return maskedCap(text, max, redact);
 	}
 	return "";
 }
@@ -181,15 +232,18 @@ export function priorActions(entries: EntryView[], count: number, redact = false
 	return out.reverse();
 }
 
-/** Render a delta of branch entries for turn review, capped. */
-export function renderDelta(entries: EntryView[], max = 6000, redact = false): string {
+/** Render a delta of branch entries for turn review, capped. `skillTurns` is as for `userTurnText`. */
+export function renderDelta(entries: EntryView[], max = 6000, redact = false, skillTurns = false): string {
 	const lines: string[] = [];
 	for (const e of entries) {
+		const userText = userTurnText(e, skillTurns);
+		if (userText !== "") {
+			lines.push(`USER: ${maskedCap(userText, 800, redact)}`);
+			continue;
+		}
 		if (e.type !== "message" || !e.message) continue;
 		const m = e.message;
-		if (m.role === "user" && m.text.trim().length > 0) {
-			lines.push(`USER: ${maskedCap(m.text, 800, redact)}`);
-		} else if (m.role === "assistant") {
+		if (m.role === "assistant") {
 			if (m.text.trim().length > 0) lines.push(`ASSISTANT: ${maskedCap(m.text, 1500, redact)}`);
 			for (const tc of m.toolCalls) lines.push(`  call ${tc.name}: ${previewOf(tc, redact)}`);
 		} else if (m.role === "toolResult") {

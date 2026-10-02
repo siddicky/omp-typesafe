@@ -1,4 +1,4 @@
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Questions } from "@typesafe-ai/sdk";
 import {
 	apiKeyPresent,
@@ -18,13 +18,18 @@ import {
 import type { WireAnswer } from "./client";
 import { agentDir, getConfig, getConfigWarnings, loadConfig, subagentGuardEnabled } from "./config";
 import type { TypesafeRole } from "./config";
-import type { ExtensionAPI, HostContentBlock, HostContext, HostEvents, HostLogger, HostMessage, NotifyLevel, ZodSchema } from "./host";
+import type { ExtensionAPI, HostContentBlock, HostContext, HostEvents, HostLogger, HostMessage, NotifyLevel, ToolCallResult, ZodSchema } from "./host";
 import { loadPriorities } from "./priorities";
 import { getSubagentStats, resetSubagentStats, skipSubagent } from "./subagent";
 import { captureBaseline, collectEvidence, collectStatus, recordAction, repoOutline, resetEvidenceTurn } from "./evidence";
 import type { CollectOptions, Evidence } from "./evidence";
-import { claimedIntent, lastUserText, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch } from "./branch";
+import { claimedIntent, lastUserText, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch, userTurnText } from "./branch";
 import type { EntryView } from "./branch";
+import { APPROVAL_TOOLS, decideApproval, detectApprovalFlips } from "./pipeline/approval";
+import { DAG_CALLS, planGuardDecision } from "./pipeline/plan-guard";
+import { isPipelineSkill, latestUserTurnSkill, parseSkillPrompt } from "./pipeline/skill";
+import type { SkillInvocation } from "./pipeline/skill";
+import { buildQuoteCorpus, checkSpec, isSpecPath, renderSpecNote, SPEC_NOTE_CUSTOM_TYPE, specHash } from "./pipeline/spec";
 import {
 	beginPrompt,
 	beginTurn,
@@ -92,6 +97,22 @@ let planPrompt = "";
 /** planPrompt came from before_agent_start's event.prompt, and the user message_end that carries that prompt has not arrived yet. */
 let planPromptAwaitingEcho = false;
 let planOutline: string | null = null;
+/**
+ * The skill the latest prompt invoked, as before_agent_start read it off the prompt (null for any other prompt, and
+ * always null with pipeline.skillAware off). The prompt is not in the branch yet then, and in print mode never is as
+ * a skill entry, so the branch cannot say.
+ */
+let promptSkill: SkillInvocation | null = null;
+// What the pipeline features did this session, for /adversary status.
+let planGuardBlocks = 0;
+let approvalBlocks = 0;
+let approvalWouldBlocks = 0;
+let specNotesSent = 0;
+/** One key per spec file content that already got its note (see checkSpecWrite). */
+const specNoteKeys = new Set<string>();
+
+/** Tools whose result may hold a draft deep-interview spec (checkSpecWrite looks at the path). */
+const SPEC_WRITE_TOOLS = new Set(["write", "edit", "apply_patch"]);
 
 /** Tools whose failure can still leave side effects behind: an errored result is reviewed. */
 const REVIEW_WHEN_FAILED = new Set(["bash", "eval"]);
@@ -243,6 +264,11 @@ function redactOn(): boolean {
 	return getConfig().adversary.redact;
 }
 
+/** Is a skill the user invoked their turn (`pipeline.skillAware`)? Off, only user messages are, as before the pipeline features. */
+function skillTurns(): boolean {
+	return getConfig().pipeline.skillAware;
+}
+
 function sanitizeState(state: Record<string, unknown>): Record<string, unknown> {
 	return sanitizeValue(state, redactOn()) as Record<string, unknown>;
 }
@@ -255,20 +281,22 @@ function withProposed(soFar: string, proposed: string | undefined, max = 6000): 
 	return maskedTail(joined, max, redactOn());
 }
 
-/** First user message at or after `from`: the plan's objective once it is in the branch. */
+/**
+ * First user turn at or after `from`: the plan's objective once it is in the branch. With pipeline.skillAware a skill the
+ * user invoked is a turn too, and what they typed besides the skill token is what they said (see userTurnText).
+ */
 function firstUserTextFrom(entries: EntryView[], from: number): string {
 	for (let i = Math.max(0, from); i < entries.length; i++) {
-		const e = entries[i];
-		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) return maskedCap(e.message.text.trim(), 4000, redactOn());
+		const text = userTurnText(entries[i], skillTurns()).trim();
+		if (text.length > 0) return maskedCap(text, 4000, redactOn());
 	}
 	return "";
 }
 
-/** omp's id of the first user message at or after `from`; null when there is none, or it has no id. */
+/** omp's id of the first user turn at or after `from`; null when there is none, or it has no id. */
 function firstUserIdFrom(entries: EntryView[], from: number): string | null {
 	for (let i = Math.max(0, from); i < entries.length; i++) {
-		const e = entries[i];
-		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) return e.id;
+		if (userTurnText(entries[i], skillTurns()).trim().length > 0) return entries[i].id;
 	}
 	return null;
 }
@@ -497,6 +525,12 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		reviewedCallIds.clear();
 		stopGateUses = 0;
 		baseline = null;
+		promptSkill = null;
+		planGuardBlocks = 0;
+		approvalBlocks = 0;
+		approvalWouldBlocks = 0;
+		specNotesSent = 0;
+		specNoteKeys.clear();
 		resetAmbiguitySession();
 		planStart = -1;
 		planStartId = null;
@@ -537,6 +571,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			const start = planStartIndex(entries);
 			if (start >= 0 && firstUserIdFrom(entries, start) !== null) planStart = -1;
 		}
+		// Another branch has not seen the spec notes this one did.
+		specNoteKeys.clear();
 		await resetCursor(event, ctx);
 	};
 	on("session_branch", resetCursorAndPlan);
@@ -566,9 +602,13 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		...(focusPaths && focusPaths.length > 0 ? { focusPaths } : {}),
 		...(baseline ? { baseline } : {}),
 		redact: getConfig().adversary.redact,
+		excludePipeline: getConfig().pipeline.skillAware,
 	});
 
-	/** Queue a host message; sendMessage returns void, so all that can be reported is that it did not throw. */
+	/**
+	 * Queue a host message; sendMessage returns void, so all that can be reported is that it did not throw. Only an aside goes
+	 * out this way: the one caller (the spec note) needs its message at the model's next step, and `nextTurn` would be later.
+	 */
 	const send = (message: HostMessage, options: { deliverAs: "aside" }): boolean => {
 		try {
 			const sent: unknown = pi.sendMessage(message, options);
@@ -605,7 +645,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	 * prompt that came before the plan marker (--plan-yolo) is not replaced by a later short reply.
 	 */
 	const planTask = (entries: EntryView[]): string => {
-		if (planPrompt === "") planPrompt = firstUserTextFrom(entries, planStart) || lastUserText(entries, 4000, redactOn());
+		if (planPrompt === "") planPrompt = firstUserTextFrom(entries, planStart) || lastUserText(entries, 4000, redactOn(), skillTurns());
 		return planPrompt;
 	};
 
@@ -631,7 +671,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				const typed = getUserReplies();
 				const [outline, status] = await Promise.all([
 					outlineFor(ctx, signal),
-					opts.status !== undefined ? opts.status : collectStatus(pi, ctx.cwd, { signal, redact }).then((s) => s.status ?? ""),
+					opts.status !== undefined ? opts.status : collectStatus(pi, ctx.cwd, { signal, redact, excludePipeline: getConfig().pipeline.skillAware }).then((s) => s.status ?? ""),
 				]);
 				const state = sanitizeState({
 					task: maskedCap(task, 4000, redact),
@@ -696,21 +736,124 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	on("before_agent_start", async (event, ctx) => {
+	// ---- pipeline (omp-skills) ---------------------------------------------------
+	// deep-interview -> a spec, ralplan -> a PRD, dag -> a run. Everything here is local: no Jev call, nothing sent.
+
+	/**
+	 * Is the current prompt a run of a pipeline skill, a turn the skill drives itself (its own interview, its own
+	 * gates)? `entries` is the branch once the prompt is on it; without it only what before_agent_start read off the
+	 * prompt counts, because the branch then still ends with the previous prompt.
+	 */
+	const pipelineRun = (entries?: EntryView[]): boolean => {
+		const cfg = getConfig().pipeline;
+		if (!cfg.skillAware) return false;
+		const invoked = promptSkill ?? (entries ? latestUserTurnSkill(entries) : null);
+		return invoked !== null && isPipelineSkill(invoked.name, cfg.skills);
+	};
+
+	/**
+	 * Is the plan's task empty because the user's only prompt so far was a skill invoked with nothing typed besides its
+	 * token? Its expanded text is no stand-in for a task and the bare token says nothing, so there is nothing to score
+	 * until they write something. An empty task for any other reason is scored as it always was.
+	 */
+	const noWordsYet = (entries: EntryView[], task: string): boolean => {
+		if (task.trim() !== "" || !getConfig().pipeline.skillAware) return false;
+		return promptSkill !== null || latestUserTurnSkill(entries) !== null;
+	};
+
+	/**
+	 * What the pipeline guards say about one tool call: a block, or nothing. Each reads the branch and the input and
+	 * nothing else (no model, no network) and fails open, so a bug here can never stop a tool.
+	 */
+	const pipelineGuard = (toolName: string, input: unknown, ctx: HostContext): ToolCallResult | undefined => {
+		const cfg = getConfig().pipeline;
+		let entries: EntryView[] | undefined;
+		const branch = (): EntryView[] => (entries ??= scanBranch(ctx.sessionManager.getBranch()));
 		try {
+			// Scanning the branch costs more than looking for the two names, and most eval cells call neither.
+			const code = isRecord(input) && typeof input.code === "string" ? input.code : "";
+			if (cfg.planGuard && toolName === "eval" && DAG_CALLS.some((name) => code.includes(name))) {
+				const verdict = planGuardDecision(branch(), toolName, input, cfg);
+				if (verdict.block) {
+					planGuardBlocks += 1;
+					return { block: true, reason: verdict.reason };
+				}
+			}
+		} catch (err) {
+			logger?.warn?.(`[typesafe] plan guard failed: ${describeError(err)}`);
+		}
+		try {
+			// Most writes approve nothing, and reading the input is cheaper than scanning the branch.
+			if (cfg.approvalGuard && APPROVAL_TOOLS.has(toolName) && detectApprovalFlips(toolName, input).length > 0) {
+				const decision = decideApproval(toolName, input, branch(), { askAvailable: askToolActive(ctx) });
+				if (decision.action === "block") {
+					approvalBlocks += 1;
+					return { block: true, reason: decision.reason };
+				}
+				if (decision.action === "would_block") {
+					// No `ask` tool (a headless run): nobody could have answered, and nothing is stopped; it is only recorded.
+					approvalWouldBlocks += 1;
+					logger?.info?.(`[typesafe] would block ${decision.flip.artifact} approval (no ask tool): ${decision.reason}`);
+				} else if (decision.failedOpen) {
+					logger?.debug?.(`[typesafe] approval guard failed open: ${decision.failedOpen}`);
+				}
+			}
+		} catch (err) {
+			logger?.warn?.(`[typesafe] approval guard failed: ${describeError(err)}`);
+		}
+		return undefined;
+	};
+
+	/**
+	 * A write to `.omp/pipeline/specs/<slug>.md`: check the draft as it is on disk and, when it has problems, tell the model
+	 * once per content (a rewrite that changes nothing says nothing again). Advisory: it never blocks or edits the result,
+	 * and a file it cannot read is no problem. The note is an aside: a write is always followed by a model step, which
+	 * takes it up at the step boundary, before the approval ask. `nextTurn` would hold it until the user's next prompt,
+	 * after the spec was asked about.
+	 */
+	const checkSpecWrite = async (input: unknown, ctx: HostContext): Promise<void> => {
+		try {
+			const target = inputPaths(input).find(isSpecPath);
+			if (!target) return;
+			const abs = resolve(ctx.cwd ?? process.cwd(), target);
+			const text = await Bun.file(abs).text();
+			const check = checkSpec(text, buildQuoteCorpus(scanBranch(ctx.sessionManager.getBranch())));
+			const key = `${abs}\0${specHash(text)}`;
+			if (check.problems.length === 0 || specNoteKeys.has(key)) return;
+			const note = renderSpecNote(target, check.problems);
+			if (note === null) return;
+			specNoteKeys.add(key);
+			// Only a note that went out is spent; a failed send may be retried by the next write of the same content.
+			if (send({ customType: SPEC_NOTE_CUSTOM_TYPE, content: note, display: true, attribution: "agent" }, { deliverAs: "aside" })) specNotesSent += 1;
+			else specNoteKeys.delete(key);
+		} catch (err) {
+			logger?.debug?.(`[typesafe] spec check skipped: ${describeError(err)}`);
+		}
+	};
+
+	on("before_agent_start", async (event, ctx) => {
+		promptSkill = null;
+		try {
+			const raw = isRecord(event) && typeof event.prompt === "string" ? event.prompt : "";
+			promptSkill = getConfig().pipeline.skillAware ? parseSkillPrompt(raw) : null;
 			const entries = branchEntries(ctx);
 			if (!planModeActive(entries)) return;
+			// A skill's prompt is its whole expanded text; what the user said is what they typed besides the skill token.
+			const prompt = (promptSkill ? promptSkill.args : raw).trim();
 			// The first prompt of a plan is its objective; later prompts are answers, not a new task.
 			if (planPrompt === "") {
-				const prompt = isRecord(event) && typeof event.prompt === "string" ? event.prompt.trim() : "";
 				const persisted = firstUserTextFrom(entries, planStart);
 				planPrompt = persisted || maskedCap(prompt, 4000, redactOn());
-				planPromptAwaitingEcho = persisted === "" && planPrompt !== "";
+				// An expanded skill prompt reaches the branch as a skill-prompt entry, with no user message to echo it. Every other
+				// prompt does, the raw `/skill:` text of print mode included, and it is not a reply, even when nothing but the token
+				// was typed (planPrompt is "" then, and the echo must not become the objective).
+				planPromptAwaitingEcho = persisted === "" && raw.trim() !== "" && promptSkill?.source !== "expanded";
 			} else {
 				// A later prompt is a reply; a flag left over from a first prompt that never reached its message_end must not swallow it.
 				planPromptAwaitingEcho = false;
 			}
-			if (planStartScored || planPrompt === "") return;
+			// A pipeline skill runs its own interview and gates: nothing to score, and no question to add to its own.
+			if (pipelineRun() || planStartScored || planPrompt === "") return;
 			return await steerIfAmbiguous(ctx, entries, "plan_start", planPrompt, { asReturn: true });
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity plan_start failed: ${describeError(err)}`);
@@ -721,14 +864,19 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		try {
 			if (!isRecord(event)) return;
 			const toolName = typeof event.toolName === "string" ? event.toolName : "";
+			// Synchronous and local, so ahead of the gate's early returns (they would let an eval cell by) and its Jev call.
+			const blocked = pipelineGuard(toolName, event.input, ctx);
+			if (blocked) return blocked;
 			if (toolName !== "write" || !isProposeWrite(event.input)) return;
 			const entries = branchEntries(ctx);
 			const gcfg = getConfig().ambiguityGate;
-			if (!gateEnabled() || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries)) return;
+			if (!gateEnabled() || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries) || pipelineRun(entries)) return;
 			// Once the ask budget for this plan is spent, stop gating rather than looping.
 			if (asksObserved() >= gcfg.maxAsksPerPlan) return;
 			const proposed = isRecord(event.input) && typeof event.input.content === "string" ? event.input.content : undefined;
-			const result = await runGate(ctx, entries, "propose", planTask(entries), { proposed });
+			const task = planTask(entries);
+			if (noWordsYet(entries, task)) return;
+			const result = await runGate(ctx, entries, "propose", task, { proposed });
 			if (!result) return;
 			const askAvailable = askToolActive(ctx);
 			const decision = proposeDecision(result, gcfg, ctx?.hasUI === true, { askAvailable });
@@ -751,18 +899,20 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			if (isRecord(event) && (endedAbnormally(event.message) || interruptedBatch(event.toolResults))) return;
 			let reviewEvidence: Evidence | undefined;
 			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries)) {
-				const delta = renderDelta(deltaEntries, 6000, redactOn());
+				const delta = renderDelta(deltaEntries, 6000, redactOn(), skillTurns());
 				if (delta.trim().length > 0) {
 					// No git probes for a review the call budget would suppress anyway.
 					reviewEvidence = cfg.evidence && hasCallBudget() ? await collectEvidence(pi, ctx.cwd, evidenceOptions()) : undefined;
-					const state: Record<string, unknown> = { task: lastUserText(entries, 1200, redactOn()), review_priorities: priorities, delta };
+					const state: Record<string, unknown> = { task: lastUserText(entries, 1200, redactOn(), skillTurns()), review_priorities: priorities, delta };
 					if (reviewEvidence) state.evidence = reviewEvidence;
 					await review(pi, "turn", sanitizeState(state), ctx, { evidence: reviewEvidence }, resolvedRole());
 				}
 			}
 			// The gate only needs `git status`, which the turn review already collected. Under --plan-yolo
-			// nothing marks the start of the plan, so its first evaluation stands in for plan_start.
-			await steerIfAmbiguous(ctx, entries, planStartScored ? "turn_end" : "plan_start", planTask(entries), { status: reviewEvidence?.status });
+			// nothing marks the start of the plan, so its first evaluation stands in for plan_start. A pipeline skill's own
+			// turn is left to the skill, and so is a skill the user has not yet said anything beside.
+			const task = planTask(entries);
+			if (!pipelineRun(entries) && !noWordsYet(entries, task)) await steerIfAmbiguous(ctx, entries, planStartScored ? "turn_end" : "plan_start", task, { status: reviewEvidence?.status });
 		} catch (err) {
 			logger?.warn?.(`[typesafe] turn_end review failed: ${describeError(err)}`);
 		} finally {
@@ -778,11 +928,12 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		if (!planModeActive(entries)) return;
 		const text = textFromContent(raw.content, 4000, redactOn()).trim();
 		if (text.length === 0) return;
-		if (planPrompt === "") planPrompt = text;
-		// The user message that carries the plan's own prompt is not an answer. omp builds event.prompt by joining a
-		// message's text blocks with "" and the branch joins them with "\n", so the two texts cannot be compared: the
-		// first user message after before_agent_start captured the prompt is that prompt.
-		else if (planPromptAwaitingEcho) planPromptAwaitingEcho = false;
+		// The user message that carries the plan's own prompt is not an answer, and not the objective either when
+		// before_agent_start already read the prompt (a raw skill token with nothing typed besides it has none). omp builds
+		// event.prompt by joining a message's text blocks with "" and the branch joins them with "\n", so the two texts cannot
+		// be compared: the first user message after before_agent_start captured the prompt is that prompt.
+		if (planPromptAwaitingEcho) planPromptAwaitingEcho = false;
+		else if (planPrompt === "") planPrompt = text;
 		else recordFollowUp(text);
 	};
 
@@ -804,7 +955,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			if (!phaseAllowed(entries)) return;
 			recordMessageReviewed();
 			const state: Record<string, unknown> = {
-				task: lastUserText(entries, 1200, redactOn()),
+				task: lastUserText(entries, 1200, redactOn(), skillTurns()),
 				review_priorities: priorities,
 				assistant_message: text,
 				recent_actions: priorActions(entries, 5, redactOn()),
@@ -825,6 +976,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				if (planModeActive(branchEntries(ctx))) recordAskResult(event.input, event.content, event.isError === true, event.details);
 				return;
 			}
+			// Before the review gates below: the check needs no key and no reviewer, and the review still runs after it.
+			if (SPEC_WRITE_TOOLS.has(toolName) && event.isError !== true && getConfig().pipeline.specChecks) await checkSpecWrite(event.input, ctx);
 			if (toolCallId) {
 				if (reviewedCallIds.has(toolCallId)) return;
 				reviewedCallIds.add(toolCallId);
@@ -851,7 +1004,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 					? await collectEvidence(pi, ctx.cwd, evidenceOptions(EDIT_TOOLS.has(toolName) ? editedPaths(event.input) : undefined))
 					: undefined;
 			const state: Record<string, unknown> = {
-				task: lastUserText(entries, 1200, redactOn()),
+				task: lastUserText(entries, 1200, redactOn(), skillTurns()),
 				review_priorities: priorities,
 				// Masked before it is stringified and cut: JSON escaping would hide quoted secrets, and a cut could split one.
 				action: { tool: toolName, input: stringifyInput(sanitizeValue(event.input, redactOn(), { maxString: TOOL_INPUT_CAP * 4 }), TOOL_INPUT_CAP) },
@@ -893,7 +1046,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			};
 			const lastMessage = isRecord(event) ? lastMessageText(event.last_assistant_message) : "";
 			const state = sanitizeState({
-				task: lastUserText(entries, 1200, redactOn()),
+				task: lastUserText(entries, 1200, redactOn(), skillTurns()),
 				review_priorities: priorities,
 				final_assistant_message: lastMessage ? maskedCap(lastMessage, 2000, redactOn()) : claimedIntent(entries, 2000, redactOn()),
 			});
@@ -1054,6 +1207,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				const clientError = getClientError();
 				const warnings = getConfigWarnings();
 				const subagents = getSubagentStats();
+				const p = cfg.pipeline;
+				const onOff = (value: boolean): string => (value ? "on" : "off");
 				const suppressed = Object.entries(stats.suppressed)
 					.map(([reason, count]) => `${reason}=${count}`)
 					.join(" ");
@@ -1074,6 +1229,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 						return `ambiguity gate: ${state} (threshold ${fmt2(g.threshold)}); last ${fmt2(last.ambiguity)} trigger=${last.trigger} weakest=${last.weakest} gap=${last.gap} decision=${last.decision}; asks observed=${asksObserved()}`;
 					})(),
 					`subagent guard: ${subagentGuardEnabled() ? "on" : "off (TYPESAFE_SUBAGENT_GUARD)"}; subagent sessions skipped=${subagents.sessions} (hook calls skipped=${subagents.hookCalls})`,
+					`pipeline guards: plan guard ${onOff(p.planGuard)} (blocked=${planGuardBlocks}); approval guard ${onOff(p.approvalGuard)} (blocked=${approvalBlocks}, would block=${approvalWouldBlocks})`,
+					`pipeline checks: spec checks ${onOff(p.specChecks)} (notes sent=${specNotesSent}); skill-aware ${onOff(p.skillAware)} (${p.skills.length > 0 ? p.skills.join(",") : "no skills"})`,
 				];
 				if (warnings.length > 0) lines.push(`config warnings: ${warnings.join(" | ")}`);
 				notifyVia(ctx, logger, lines.join("\n"));

@@ -80,6 +80,7 @@ const ENV_KEYS = [
 	"TYPESAFE_DEFAULT_MODEL",
 	"TYPESAFE_BENCH_LOG",
 	"TYPESAFE_SUBAGENT_GUARD",
+	"TYPESAFE_PIPELINE_GUARD",
 	"PI_CODING_AGENT_DIR",
 ];
 const savedEnv: Record<string, string | undefined> = {};
@@ -128,6 +129,7 @@ afterEach(() => {
 	delete process.env.TYPESAFE_BENCH_LOG;
 	delete process.env.TYPESAFE_ROLE;
 	delete process.env.TYPESAFE_SUBAGENT_GUARD;
+	delete process.env.TYPESAFE_PIPELINE_GUARD;
 });
 
 const replies: { gate: Answers; review: Answers; stop: Answers; other: Answers } = { gate: {}, review: {}, stop: {}, other: {} };
@@ -3173,5 +3175,920 @@ describe("subagent sessions", () => {
 		await h.start();
 		await drivePrompt(h, h.ctx, h.branch);
 		expect(reviewCalls().length).toBeGreaterThan(0);
+	});
+});
+
+// ---- pipeline (omp-skills) ---------------------------------------------------------------
+// The modules are tested on their own in test/pipeline/; these tests drive the real factory the way omp does and check
+// the wiring: which hook acts, what it returns or sends, what stays off, and that a subagent's session is left alone.
+
+describe("pipeline (omp-skills)", () => {
+	const SUB = { kind: "sub", id: "GleamingHalibut", name: "task", depth: 1, parentId: "Main" };
+	/** `ctx` for a subagent's session over `branch`, with `agent` defined the way omp defines it (not enumerable). */
+	function subCtx(h: Harness, branch: unknown[]): Record<string, any> {
+		const copy: Record<string, any> = { ...h.ctx, sessionManager: { getBranch: () => branch, getSessionId: () => "sub-1" } };
+		Object.defineProperty(copy, "agent", { value: SUB, enumerable: false });
+		return copy;
+	}
+	/** The text of `/adversary status`; a headless session's notices go to the log, so it is asked as if there were a UI. */
+	const status = async (h: Harness): Promise<string> => {
+		const hasUI = h.ctx.hasUI;
+		h.ctx.hasUI = true;
+		try {
+			await h.command("adversary", "status");
+		} finally {
+			h.ctx.hasUI = hasUI;
+		}
+		return h.notices.at(-1)!.message;
+	};
+
+	describe("plan guard", () => {
+		const cell = (code: string, language = "py") => ({ toolName: "eval", toolCallId: "e1", input: { language, code } });
+		const DAG_CELL = cell("state = await run_dag(state_path='.omp/pipeline/dag/login.json')");
+		const REASON = "run_dag() cannot run in plan mode: dag workers are read-only there (no write, bash or eval), so every node would end blocked. Nothing was run. Ask the user to leave plan mode (Shift+Tab or /plan), then re-run the cell. Do not retry before they have.";
+
+		test("an eval cell that calls run_dag in plan mode is blocked with the reason, and nothing else happens", async () => {
+			const h = setup({}, [planMode(), userMsg("run the dag")], { hasUI: true });
+			await h.start();
+			expect(await h.fire("tool_call", DAG_CELL)).toEqual({ block: true, reason: REASON });
+			expect(await h.fire("tool_call", cell("plan = await prepare_dag(prd_path='.omp/pipeline/prd.json')"))).toMatchObject({ block: true, reason: expect.stringContaining("prepare_dag() cannot run in plan mode") });
+			// No Jev call, no message, no git: it is a local check.
+			expect(mockState.calls).toEqual([]);
+			expect(h.sent).toEqual([]);
+			expect(h.execCalls).toEqual([]);
+			expect(await status(h)).toContain("pipeline guards: plan guard on (blocked=2); approval guard off (blocked=0, would block=0)");
+		});
+
+		test("it needs no TypeSafe key and runs headless too", async () => {
+			mockState.apiKey = false;
+			const h = setup({}, [planMode()]);
+			await h.start();
+			expect((await h.fire("tool_call", DAG_CELL))?.block).toBe(true);
+		});
+
+		test("outside plan mode the same cell runs: no plan marker, plan left, and plan-mode-reference after approval", async () => {
+			for (const branch of [[userMsg("go")], [planMode(), modeChange("none")], [planMode(), modeChange("plan_paused")], [planMode(), marker("plan-mode-reference")], [planMode(), marker("plan-yolo-handoff")]]) {
+				const h = setup({}, branch);
+				await h.start();
+				expect(await h.fire("tool_call", DAG_CELL)).toBeUndefined();
+			}
+			// A later plan is a plan again.
+			const again = setup({}, [planMode(), modeChange("none"), planMode()]);
+			await again.start();
+			expect((await again.fire("tool_call", DAG_CELL))?.block).toBe(true);
+		});
+
+		test("under --plan-yolo the plan-mode-context message is the marker", async () => {
+			const h = setup({}, [marker("plan-mode-context"), userMsg("run it")]);
+			await h.start();
+			expect((await h.fire("tool_call", DAG_CELL))?.block).toBe(true);
+		});
+
+		test("only an eval cell that calls it: other tools, other code and other languages go through in plan mode", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			const through = async (event: Record<string, unknown>) => expect(await h.fire("tool_call", event)).toBeUndefined();
+			await through({ toolName: "write", toolCallId: "w", input: { path: "notes.md", content: "run_dag(state_path=x)" } });
+			await through({ toolName: "bash", toolCallId: "b", input: { command: "echo 'run_dag(x)'" } });
+			await through(cell("print(1)"));
+			await through(cell("# run_dag(state_path=x) later\nprint('run_dag(x)')"));
+			await through(cell("my_run_dag(x)\nrun_dag_state = 1\nf = partial(run_dag, x)"));
+			await through(cell("await run_dag(state_path=x)", "js"));
+			await through({ toolName: "eval", toolCallId: "e2", input: { code: 3 } });
+			await through({ toolName: "eval", toolCallId: "e3", input: "run_dag(x)" });
+			await through({ toolName: "eval", toolCallId: "e4" });
+			// The gate's own early returns are untouched: a propose write is still the gate's, and an empty gate lets it by.
+			await through({ toolName: "write", toolCallId: "p", input: { path: "xd://propose", content: "# Plan" } });
+		});
+
+		test("a call is a call wherever it sits in running code", async () => {
+			const h = setup({}, [planMode()]);
+			await h.start();
+			for (const code of ["await runner.run_dag(x)", "result = await run_dag (\n  state_path=x)", 'print(f"{await run_dag(state_path=x)}")', "def go():\n    return run_dag(x)"]) {
+				expect((await h.fire("tool_call", cell(code)))?.block, code).toBe(true);
+			}
+		});
+
+		test("pipeline.planGuard false, and TYPESAFE_PIPELINE_GUARD, switch it off; the environment wins over the file", async () => {
+			const off = setup({ pipeline: { planGuard: false } }, [planMode()]);
+			await off.start();
+			expect(await off.fire("tool_call", DAG_CELL)).toBeUndefined();
+			expect(await status(off)).toContain("plan guard off (blocked=0)");
+
+			for (const value of ["0", "false", "off", "no"]) {
+				process.env.TYPESAFE_PIPELINE_GUARD = value;
+				const killed = setup({}, [planMode()]);
+				await killed.start();
+				expect(await killed.fire("tool_call", DAG_CELL), value).toBeUndefined();
+			}
+			process.env.TYPESAFE_PIPELINE_GUARD = "1";
+			const forced = setup({ pipeline: { planGuard: false } }, [planMode()]);
+			await forced.start();
+			expect((await forced.fire("tool_call", DAG_CELL))?.block).toBe(true);
+		});
+
+		test("it fails open: an unreadable branch lets the cell run", async () => {
+			const h = setup({}, [planMode()]);
+			await h.start();
+			h.ctx.sessionManager.getBranch = () => {
+				throw new Error("branch exploded");
+			};
+			expect(await h.fire("tool_call", DAG_CELL)).toBeUndefined();
+			expect(h.warns.some((w) => w.includes("plan guard failed: branch exploded"))).toBe(true);
+		});
+
+		test("a subagent's session is left alone, plan mode or not", async () => {
+			const h = setup({}, [planMode()]);
+			await h.start();
+			expect(await h.fire("tool_call", DAG_CELL, subCtx(h, [planMode()]))).toBeUndefined();
+			expect(await status(h)).toContain("plan guard on (blocked=0)");
+			process.env.TYPESAFE_SUBAGENT_GUARD = "0";
+			expect((await h.fire("tool_call", DAG_CELL, subCtx(h, [planMode()])))?.block).toBe(true);
+		});
+
+		test("the ambiguity gate's propose block still works beside it", async () => {
+			const h = setup({}, [planMode(), userMsg("Make it better")], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect((await h.fire("tool_call", { toolName: "write", toolCallId: "p", input: { path: "xd://propose", content: "# Plan" } }))?.block).toBe(true);
+			expect(gateCalls().length).toBe(1);
+		});
+	});
+
+	describe("skill awareness", () => {
+		const BODY = "# Deep interview\n\nInterview the user until the ambiguity is low, then write the spec.";
+		/** What omp hands before_agent_start for `/skill:<name> args` in the TUI and over RPC (omp's user-invocation template). */
+		const expanded = (name: string, args: string): string =>
+			`[IMPORTANT: User invoked the "${name}" skill; follow its instructions. Full skill below.]\n\n${BODY}\n\n---\n\n[Skill directory: /skills/${name}]\nResolve relative paths in this skill against this absolute directory.${args ? `\nUser: ${args}` : ""}`;
+		/** The entry omp records for it: a custom message, not a user message. */
+		const skillEntry = (name: string, args: string, id?: string) => ({
+			...(id ? { id } : {}),
+			type: "custom_message",
+			customType: "skill-prompt",
+			content: expanded(name, args),
+			display: true,
+			attribution: "user",
+			details: { name, path: `/skills/${name}/SKILL.md`, args, prompt: `/skill:${name} ${args}`.trim(), lineCount: 4 },
+		});
+		const endTurn = (h: Harness) => h.fire("turn_end", { turnIndex: 0, message: { role: "assistant", stopReason: "stop" }, toolResults: [] });
+
+		test.each(["deep-interview", "ralplan", "dag"])("the first prompt of a plan that runs /skill:%s is not scored, and no ask aside goes out", async (name) => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers(); // very ambiguous: any evaluation would steer
+			expect(await h.fire("before_agent_start", { prompt: expanded(name, "add a flag") })).toBeUndefined();
+			expect(gateCalls()).toEqual([]);
+			expect(scores()).toEqual([]);
+			h.branch.push(skillEntry(name, "add a flag"), asstMsg("Which commands should the flag cover?"));
+			await h.fire("turn_start", { turnIndex: 0 });
+			await endTurn(h);
+			expect(gateCalls()).toEqual([]);
+			expect(scores()).toEqual([]);
+			expect(h.sent).toEqual([]);
+		});
+
+		test("the control: a plain vague prompt in the same state is scored and steered", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect((await h.fire("before_agent_start", { prompt: "Make it better" }))?.message).toBeDefined();
+			expect(gateCalls().length).toBe(1);
+			expect(gateCalls()[0].state.task).toBe("Make it better");
+		});
+
+		test("print mode hands over the raw text, and no skill entry ever lands: the prompt's own reading holds for the whole turn", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect(await h.fire("before_agent_start", { prompt: "/skill:ralplan write the PRD" })).toBeUndefined();
+			h.branch.push(userMsg("/skill:ralplan write the PRD"), asstMsg("Reading the spec."));
+			await h.fire("turn_start", { turnIndex: 0 });
+			await endTurn(h);
+			expect(gateCalls()).toEqual([]);
+			expect(h.sent).toEqual([]);
+		});
+
+		test("a skill the user invoked is the user's turn: reviews take its args as the task, never the skill's text", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			await h.fire("before_agent_start", { prompt: expanded("deep-interview", "add a flag") });
+			h.branch.push(skillEntry("deep-interview", "add a flag"), asstMsg("Which commands should the flag cover?"));
+			await h.fire("turn_start", { turnIndex: 0 });
+			replies.review = reviewAnswers("turn", "adversarial", 0.2);
+			await endTurn(h);
+			const review = reviewCalls().at(-1)!;
+			expect(review.state.task).toBe("add a flag");
+			expect(review.state.delta).toContain("USER: add a flag");
+			expect(JSON.stringify(review.state)).not.toContain("[IMPORTANT");
+			expect(JSON.stringify(review.state)).not.toContain("Interview the user until");
+
+			// An action review the same way, in a session that is not planning at all.
+			const exec = setup({}, [userMsg("earlier request"), skillEntry("dag", "run the login PRD")]);
+			await exec.start();
+			await exec.fire("turn_start", { turnIndex: 0 });
+			replies.review = reviewAnswers("action", "adversarial", 0.2);
+			await toolResult(exec, "edit", "c1", { path: "a.ts" });
+			expect(reviewCalls().at(-1)!.state.task).toBe("run the login PRD");
+		});
+
+		test("another skill's text is not the objective either: the gate scores what was typed, and stays active", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			const out = await h.fire("before_agent_start", { prompt: expanded("my-own-skill", "Make it better") });
+			expect(out?.message).toBeDefined();
+			expect(gateCalls().length).toBe(1);
+			expect(gateCalls()[0].state.task).toBe("Make it better");
+			expect(JSON.stringify(gateCalls()[0].state)).not.toContain("[IMPORTANT");
+		});
+
+		test("the gate resumes with the next prompt, which does not replace the skill's args as the objective", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			await h.fire("before_agent_start", { prompt: expanded("deep-interview", "add a flag") });
+			h.branch.push(skillEntry("deep-interview", "add a flag", "s1"), asstMsg("Which commands should the flag cover?"));
+			await h.fire("turn_start", { turnIndex: 0 });
+			await endTurn(h);
+			expect(gateCalls()).toEqual([]);
+
+			h.branch.push(userMsg("B"));
+			expect((await h.fire("before_agent_start", { prompt: "B" }))?.message).toBeDefined();
+			expect(gateCalls().length).toBe(1);
+			expect(gateCalls()[0].state.task).toBe("add a flag");
+		});
+
+		test("a skill invocation has no user message to echo it: the next typed message is a reply, as a typed prompt's echo is not", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			await h.fire("before_agent_start", { prompt: expanded("deep-interview", "add a flag") });
+			h.branch.push(skillEntry("deep-interview", "add a flag"));
+			await h.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "just the CLI" }] } });
+			expect(ambiguity.getUserReplies()).toEqual(["just the CLI"]);
+
+			const typed = setup({}, [planMode()], { hasUI: true });
+			await typed.start();
+			replies.gate = gateAnswers(3.8, 0.9);
+			await typed.fire("before_agent_start", { prompt: "Add a flag to the CLI" });
+			await typed.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "Add a flag to the CLI" }] } });
+			expect(ambiguity.getUserReplies()).toEqual([]);
+		});
+
+		test("print mode records a user message with the raw skill text: it is the prompt's own echo, not a reply to the gate", async () => {
+			for (const prompt of ["/skill:my-own-skill Add a flag to the CLI", "/skill:ralplan write the PRD"]) {
+				const h = setup({}, [planMode()], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers(3.8, 0.9);
+				await h.fire("before_agent_start", { prompt });
+				await h.fire("message_end", { message: { role: "user", content: [{ type: "text", text: prompt }] } });
+				expect(ambiguity.getUserReplies(), prompt).toEqual([]);
+				// Only that one: the next user message is a reply, as after a typed prompt.
+				await h.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "just the CLI" }] } });
+				expect(ambiguity.getUserReplies(), prompt).toEqual(["just the CLI"]);
+			}
+		});
+
+		test("print mode with nothing typed besides the token: its echo is neither a reply nor the plan's objective", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect(await h.fire("before_agent_start", { prompt: "/skill:archify" })).toBeUndefined();
+			await h.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "/skill:archify" }] } });
+			expect(ambiguity.getUserReplies()).toEqual([]);
+			// The first words typed are the objective, not the token the echo carried.
+			h.branch.push(userMsg("Make it better"));
+			expect((await h.fire("before_agent_start", { prompt: "Make it better" }))?.message).toBeDefined();
+			expect(gateCalls()[0].state.task).toBe("Make it better");
+		});
+
+		test("the echo flag is still not set for an expanded skill prompt, which has none, and still set for a plain one", async () => {
+			const expandedFirst = setup({}, [planMode()], { hasUI: true });
+			await expandedFirst.start();
+			await expandedFirst.fire("before_agent_start", { prompt: expanded("my-own-skill", "Add a flag to the CLI") });
+			await expandedFirst.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "just the CLI" }] } });
+			expect(ambiguity.getUserReplies()).toEqual(["just the CLI"]);
+
+			const plain = setup({}, [planMode()], { hasUI: true });
+			await plain.start();
+			replies.gate = gateAnswers(3.8, 0.9);
+			await plain.fire("before_agent_start", { prompt: "Add a flag to the CLI" });
+			await plain.fire("message_end", { message: { role: "user", content: [{ type: "text", text: "Add a flag to the CLI" }] } });
+			expect(ambiguity.getUserReplies()).toEqual([]);
+		});
+
+		describe("a skill invoked with nothing typed besides its token has said nothing", () => {
+			test.each(["skillify", "archify", "deep-interview", "dag"])("/skill:%s: reviews keep the user's last real request as the task and the transcript has no USER line for it", async (name) => {
+				const h = setup({}, [userMsg("Send out the seeded email for the demo"), asstMsg("On it."), skillEntry(name, "")]);
+				await h.start();
+				await h.fire("turn_start", { turnIndex: 0 });
+				replies.review = reviewAnswers("action", "adversarial", 0.2);
+				await toolResult(h, "edit", "c1", { path: "a.ts" });
+				expect(reviewCalls().at(-1)!.state.task).toBe("Send out the seeded email for the demo");
+
+				const turn = setup({}, [userMsg("Send out the seeded email for the demo"), asstMsg("On it."), skillEntry(name, ""), asstMsg("Which PRD?")]);
+				await turn.start();
+				replies.review = reviewAnswers("turn", "adversarial", 0.2);
+				await turn.fire("turn_start", { turnIndex: 0 });
+				await endTurn(turn);
+				const state = reviewCalls().at(-1)!.state;
+				expect(state.task).toBe("Send out the seeded email for the demo");
+				expect(String(state.delta)).not.toContain(`/skill:${name}`);
+			});
+
+			test.each(["archify", "deep-interview"])("/skill:%s as a plan's first prompt: nothing is scored or blocked until the user writes, and then their words are the objective", async (name) => {
+				const h = setup({}, [planMode()], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers(); // very ambiguous: any evaluation would steer
+				expect(await h.fire("before_agent_start", { prompt: expanded(name, "") })).toBeUndefined();
+				h.branch.push(skillEntry(name, ""), asstMsg("What would you like to cover?"));
+				await h.fire("turn_start", { turnIndex: 0 });
+				await endTurn(h);
+				expect(gateCalls()).toEqual([]);
+				expect(scores()).toEqual([]);
+				expect(h.sent).toEqual([]);
+				// The propose block has no task to read either.
+				expect(await h.fire("tool_call", { toolName: "write", toolCallId: "p", input: { path: "xd://propose", content: "# Plan" } })).toBeUndefined();
+				expect(gateCalls()).toEqual([]);
+
+				h.branch.push(userMsg("a CLI flag for dry runs"));
+				expect((await h.fire("before_agent_start", { prompt: "a CLI flag for dry runs" }))?.message).toBeDefined();
+				expect(gateCalls().length).toBe(1);
+				expect(gateCalls()[0].state.task).toBe("a CLI flag for dry runs");
+				expect(JSON.stringify(gateCalls()[0].state)).not.toContain("/skill:");
+			});
+
+			test("an empty task for any other reason is scored as before: only a skill with nothing typed waits for words", async () => {
+				const h = setup({}, [planMode(), asstMsg("draft one")], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers();
+				await endTurn(h);
+				expect(gateCalls().length).toBe(1);
+				expect(gateCalls()[0].state.task).toBe("");
+			});
+
+			test("with pipeline.skillAware off there is no such rule: the old behavior, skill entries ignored", async () => {
+				const h = setup({ pipeline: { skillAware: false } }, [planMode(), skillEntry("archify", ""), asstMsg("draft")], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers();
+				await endTurn(h);
+				expect(gateCalls().length).toBe(1);
+			});
+		});
+
+		test("the gate's own git status leaves .omp/pipeline out too", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			h.exec = repoGit();
+			await h.start();
+			replies.gate = gateAnswers(3.8, 0.9);
+			await h.fire("before_agent_start", { prompt: "Add per-tenant rate limiting to the orders API" });
+			const statuses = gitCalls(h, "status");
+			expect(statuses.length).toBe(1);
+			// No pathspec on `git status`: .omp/pipeline is filtered from its output instead (see evidence.ts).
+			expect(statuses[0].slice(-2)).toEqual(["-uall", "--no-renames"]);
+			expect(statuses[0]).not.toContain("--");
+		});
+
+		test("the status it sends has the pipeline's files taken out of git's own output", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			const git = repoGit();
+			h.exec = async (cmd: string, args: string[]) => (subcommand(args) === "status" ? { code: 0, stdout: " M src/a.ts\0?? .omp/pipeline/prd.json\0?? pkg/.omp/pipeline/specs/x.md\0" } : git(cmd, args));
+			await h.start();
+			replies.gate = gateAnswers(3.8, 0.9);
+			await h.fire("before_agent_start", { prompt: "Add per-tenant rate limiting to the orders API" });
+			expect(gateCalls()[0].state.evidence.status).toBe(" M src/a.ts");
+		});
+
+		test("a skill that is not on pipeline.skills is scored; one that is, by namespace, is not", async () => {
+			const h = setup({ pipeline: { skills: ["ralplan", "acme/audit"] } }, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect(await h.fire("before_agent_start", { prompt: expanded("acme/audit", "check it") })).toBeUndefined();
+			expect(gateCalls()).toEqual([]);
+
+			const other = setup({ pipeline: { skills: ["ralplan"] } }, [planMode()], { hasUI: true });
+			await other.start();
+			replies.gate = gateAnswers();
+			expect((await other.fire("before_agent_start", { prompt: expanded("deep-interview", "add a flag") }))?.message).toBeDefined();
+			expect(gateCalls().length).toBe(1);
+		});
+
+		test("pipeline.skillAware false is the old behavior: the skill's whole text is the task", async () => {
+			const h = setup({ pipeline: { skillAware: false } }, [planMode()], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			const prompt = expanded("deep-interview", "add a flag");
+			expect((await h.fire("before_agent_start", { prompt }))?.message).toBeDefined();
+			expect(gateCalls()[0].state.task).toBe(prompt);
+			expect(await status(h)).toContain("skill-aware off");
+		});
+
+		// pipeline.skillAware is the one switch for reading a skill the user invoked as their turn, for every skill and every path.
+		describe("with pipeline.skillAware off a skill invocation is not the user's turn, for any skill", () => {
+			const off = { pipeline: { skillAware: false } };
+
+			test.each(["dag", "archify"])("an action review's task is the last user message, not /skill:%s's args", async (name) => {
+				for (const [cfg, task] of [[off, "earlier request"], [{}, "run the login PRD"]] as const) {
+					const h = setup(cfg, [userMsg("earlier request"), skillEntry(name, "run the login PRD")]);
+					await h.start();
+					await h.fire("turn_start", { turnIndex: 0 });
+					replies.review = reviewAnswers("action", "adversarial", 0.2);
+					await toolResult(h, "edit", "c1", { path: "a.ts" });
+					expect(reviewCalls().at(-1)!.state.task, JSON.stringify(cfg)).toBe(task);
+				}
+			});
+
+			test("a turn review has the same task and no USER line for the skill, and none of its text", async () => {
+				const h = setup(off, [userMsg("earlier request"), asstMsg("On it.")]);
+				await h.start();
+				await h.fire("turn_start", { turnIndex: 0 });
+				h.branch.push(skillEntry("deep-interview", "add a flag"), asstMsg("Which commands should the flag cover?"));
+				replies.review = reviewAnswers("turn", "adversarial", 0.2);
+				await endTurn(h);
+				const state = reviewCalls().at(-1)!.state;
+				expect(state.task).toBe("earlier request");
+				expect(String(state.delta)).not.toContain("add a flag");
+				expect(JSON.stringify(state)).not.toContain("[IMPORTANT");
+			});
+
+			test("a message review and the stop gate take the task the same way", async () => {
+				const h = setup({ stopGate: { enabled: true }, pipeline: { skillAware: false } }, [userMsg("earlier request"), skillEntry("dag", "run it"), asstMsg("Done.")]);
+				await h.start();
+				await h.fire("turn_start", { turnIndex: 0 });
+				replies.review = reviewAnswers("message", "adversarial", 0.2);
+				await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: "y".repeat(300) }] } });
+				expect(reviewCalls().at(-1)!.state.task).toBe("earlier request");
+				replies.stop = { verified: { type: "noul", noul: 0.05 }, left_unfinished: { type: "noul", noul: 0.9 } };
+				await h.fire("session_stop", { last_assistant_message: "All finished", stop_hook_active: false });
+				expect(mockState.calls.at(-1)!.state.task).toBe("earlier request");
+			});
+
+			test("the gate's objective is not the skill's args: only a user message is a plan's first turn", async () => {
+				// Plan started, then /skill:deep-interview with args, then a plain prompt: with the feature on the args are the objective.
+				for (const [cfg, task] of [[off, "Make it better"], [{}, "add a flag"]] as const) {
+					const h = setup(cfg, [planMode(), skillEntry("my-own-skill", "add a flag")], { hasUI: true });
+					await h.start();
+					replies.gate = gateAnswers();
+					expect((await h.fire("before_agent_start", { prompt: "Make it better" }))?.message, JSON.stringify(cfg)).toBeDefined();
+					expect(gateCalls().at(-1)!.state.task, JSON.stringify(cfg)).toBe(task);
+				}
+			});
+
+			// The plan's identity is its first user turn (a sibling made by /branch has another one): a skill is one only with the feature on.
+			test("a skill invocation on a sibling branch is not another plan's first prompt", async () => {
+				for (const [cfg, scored] of [[off, 1], [{}, 2]] as const) {
+					const planEntry = { id: "e1", type: "mode_change", mode: "plan" };
+					const h = setup(cfg, [planEntry], { hasUI: true });
+					await h.start();
+					replies.gate = gateAnswers();
+					await h.fire("before_agent_start", { prompt: "Plan the rate limiter" });
+					expect(gateCalls().length).toBeGreaterThan(0);
+					const before = gateCalls().length;
+					// The prompt never reached the branch; the user moves to a sibling under the same plan-start entry, which runs a skill.
+					h.branch.length = 0;
+					h.branch.push(planEntry, skillEntry("my-own-skill", "Plan the importer instead", "s1"));
+					await h.fire("session_branch", { newLeafId: "s1", oldLeafId: "e1" });
+					await h.fire("before_agent_start", { prompt: expanded("my-own-skill", "Plan the importer instead") });
+					expect(gateCalls().length - before, JSON.stringify(cfg)).toBe(scored - 1);
+				}
+			});
+
+			test("a turn end scores the plan with no task when the skill is all there is, as it did before", async () => {
+				const h = setup(off, [planMode(), skillEntry("deep-interview", "add a flag"), asstMsg("Which commands should the flag cover?")], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers();
+				await h.fire("turn_start", { turnIndex: 0 });
+				await endTurn(h);
+				expect(gateCalls().length).toBe(1);
+				expect(gateCalls()[0].state.task).toBe("");
+			});
+
+			test("it is the same switch for a pipeline skill: the gate is not silent for it, and the prompt's whole text is the task", async () => {
+				const h = setup(off, [planMode()], { hasUI: true });
+				await h.start();
+				replies.gate = gateAnswers();
+				const prompt = expanded("dag", "run it");
+				expect((await h.fire("before_agent_start", { prompt }))?.message).toBeDefined();
+				expect(gateCalls()[0].state.task).toBe(prompt);
+				h.branch.push(skillEntry("dag", "run it"), asstMsg("Running."));
+				await h.fire("turn_start", { turnIndex: 0 });
+				replies.review = reviewAnswers("turn", "adversarial", 0.2);
+				await endTurn(h);
+				expect(reviewCalls().length).toBeGreaterThan(0);
+				expect(reviewCalls().every((call) => !String(call.state.delta).includes("USER: run it"))).toBe(true);
+			});
+		});
+
+		test("the propose block is silent while a pipeline skill's turn is on the branch", async () => {
+			const h = setup({}, [planMode(), skillEntry("dag", "run it")], { hasUI: true });
+			await h.start();
+			replies.gate = gateAnswers();
+			expect(await h.fire("tool_call", { toolName: "write", toolCallId: "p", input: { path: "xd://propose", content: "# Plan" } })).toBeUndefined();
+			expect(gateCalls()).toEqual([]);
+			// The same plan once a plain message follows the skill is the gate's again.
+			h.branch.push(userMsg("Make it better"));
+			expect((await h.fire("tool_call", { toolName: "write", toolCallId: "p", input: { path: "xd://propose", content: "# Plan" } }))?.block).toBe(true);
+		});
+
+		test("the git evidence leaves .omp/pipeline out, and only while pipeline.skillAware is on", async () => {
+			const EXCLUDE = ":(top,exclude,glob)**/.omp/pipeline/**";
+			const probes = async (cfg: object) => {
+				const h = setup(cfg, [userMsg("go")]);
+				h.exec = repoGit();
+				await h.start();
+				await h.fire("turn_start", { turnIndex: 0 });
+				replies.review = reviewAnswers("action", "adversarial", 0.2);
+				await toolResult(h, "edit", "c1", { path: "src/a.ts" });
+				return h.execCalls.filter((args) => ["status", "diff", "grep"].includes(subcommand(args)));
+			};
+			const on = await probes({});
+			// `--stat`, `--name-only` and the removed-name grep look at the whole tree; the diffs of the action's own file name that file.
+			// `git status` takes no pathspec (its output is filtered instead), so it is the base command with or without the feature.
+			const wholeTree = on.filter((args) => !args.some((arg) => arg.startsWith(":(literal)")));
+			expect(wholeTree.map(subcommand)).toEqual(["status", "diff", "diff", "grep"]);
+			expect(wholeTree.filter((args) => subcommand(args) !== "status").every((args) => args.at(-1) === EXCLUDE)).toBe(true);
+			expect(on.filter((args) => subcommand(args) === "status").every((args) => !args.includes("--"))).toBe(true);
+			const off = await probes({ pipeline: { skillAware: false } });
+			expect(off.some((args) => args.includes(EXCLUDE))).toBe(false);
+		});
+
+		test("a subagent's prompt reads nothing: its skill run does not silence the parent's gate", async () => {
+			const h = setup({}, [planMode()], { hasUI: true });
+			await h.start();
+			expect(await h.fire("before_agent_start", { prompt: expanded("dag", "run it") }, subCtx(h, [planMode()]))).toBeUndefined();
+			replies.gate = gateAnswers();
+			expect((await h.fire("before_agent_start", { prompt: "Make it better" }))?.message).toBeDefined();
+		});
+	});
+
+	describe("spec checks", () => {
+		const SPEC_REL = ".omp/pipeline/specs/flag.md";
+		const specText = (quote: string, marker = "<!-- UNAPPROVED DRAFT -->") =>
+			[
+				marker,
+				"# Spec: a dry-run flag",
+				"",
+				"challenge: none, threshold: 10%, final ambiguity: 6%",
+				"",
+				"## Goal",
+				"",
+				"Add a --dry-run flag to the CLI.",
+				"",
+				"## Fact base",
+				"",
+				"- The CLI has no flags today.",
+				"",
+				"## Locked decisions",
+				"",
+				`- Name it --dry-run (round 1, "${quote}"): the user chose the name.`,
+				"",
+				"## Stated-but-unconfirmed assumptions",
+				"",
+				"None",
+				"",
+				"## Acceptance criteria",
+				"",
+				"- `bun test` exits 0.",
+				"",
+				"## Open items",
+				"",
+				"None",
+				"",
+				"## Work units",
+				"",
+				"- The flag in `src/cli.ts`.",
+				"",
+			].join("\n");
+		const writeSpec = (dir: string, text: string, rel = SPEC_REL): string => {
+			mkdirSync(join(dir, rel, ".."), { recursive: true });
+			writeFileSync(join(dir, rel), text);
+			return join(dir, rel);
+		};
+		const session = async (cfg: object = {}, branch: unknown[] = [userMsg("Please call it dry-run.")]) => {
+			const dir = mkdtempSync(join(root, "spec-"));
+			const h = setup({ adversary: { enabled: false }, ...cfg }, branch, { cwd: dir });
+			await h.start();
+			return { h, dir };
+		};
+		const written = (h: Harness, path = SPEC_REL, toolName = "write", id = "w1") => toolResult(h, toolName, id, { path, content: "(the model's payload is not what is checked)" });
+		const notes = (h: Harness) => h.sent.filter((m) => m.message.customType === "ai.typesafe.pipeline");
+
+		test("a spec with an invented quote gets one aside, for the model's next step: the quote, the instruction, and nothing else", async () => {
+			const { h, dir } = await session();
+			writeSpec(dir, specText("every route"));
+			expect(await written(h)).toBeUndefined();
+			expect(notes(h).length).toBe(1);
+			const { message, options } = notes(h)[0];
+			// An aside reaches the model at its next step, before it asks for approval; nextTurn would wait for the user's next prompt.
+			expect(options).toEqual({ deliverAs: "aside" });
+			expect(message).toMatchObject({ customType: "ai.typesafe.pipeline", display: true, attribution: "agent" });
+			expect(message.content).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="1"`);
+			expect(message.content).toContain('could not verify the quote in anything the user said this session: "every route"');
+			expect(message.content).toContain("before you ask the user to approve it");
+			// A local check: no Jev call, no git, and the notes count shows in the status.
+			expect(mockState.calls).toEqual([]);
+			expect(h.execCalls).toEqual([]);
+			expect(await status(h)).toContain("spec checks on (notes sent=1)");
+		});
+
+		// The reviewer sends a quiet note after a message or turn as `nextTurn` when the session is idle, so as not to wake it. The spec
+		// note is not that: a spec write is a tool result, a model step always follows it, and that step is the one that asks for
+		// approval, so only an aside is early enough (README: Spec checks). It is no steer either: no turn is triggered.
+		test("the note is an aside whatever the session reports, in plan mode and out of it: never nextTurn, never a trigger", async () => {
+			for (const branch of [[userMsg("Please call it dry-run.")], [planMode(), userMsg("Please call it dry-run.")]]) {
+				for (const idle of [false, true]) {
+					const { h, dir } = await session({}, branch);
+					h.ctx.isIdle = () => idle;
+					writeSpec(dir, specText("every route"));
+					await written(h);
+					expect(notes(h).map((n) => n.options), `${branch.length} entries, idle ${idle}`).toEqual([{ deliverAs: "aside" }]);
+				}
+			}
+		});
+
+		test("a clean spec gets none: the quote is in a user message, a skill's args, or an ask answer", async () => {
+			const askResult = { type: "message", message: { role: "toolResult", toolName: "ask", isError: false, content: [{ type: "text", text: "User selected: Call it dry-run" }], details: { question: "Name?", options: ["Call it dry-run", "Other"], multi: false, selectedOptions: ["Call it dry-run"] } } };
+			for (const evidence of [userMsg("I'd call it dry-run, yes."), skillEntry("deep-interview", "a CLI where we call it dry-run"), askResult]) {
+				const { h, dir } = await session({}, [evidence]);
+				writeSpec(dir, specText("call it dry-run"));
+				await written(h);
+				expect(h.sent, JSON.stringify(evidence).slice(0, 60)).toEqual([]);
+			}
+			// The model's own words are no evidence.
+			const { h, dir } = await session({}, [asstMsg("I will call it dry-run."), userMsg("ok")]);
+			writeSpec(dir, specText("call it dry-run"));
+			await written(h);
+			expect(notes(h).length).toBe(1);
+
+			function skillEntry(name: string, args: string) {
+				return { type: "custom_message", customType: "skill-prompt", content: `[IMPORTANT: User invoked the "${name}" skill]\n\nbody\n\n---\n\n[Skill directory: /s]\nResolve.\nUser: ${args}`, display: true, attribution: "user", details: { name, args, prompt: `/skill:${name} ${args}` } };
+			}
+		});
+
+		test("writing the same content again says nothing more; changed content with the same problem says it again", async () => {
+			const { h, dir } = await session();
+			const path = writeSpec(dir, specText("every route"));
+			await written(h);
+			await written(h, SPEC_REL, "edit", "w2");
+			await written(h, path, "write", "w3"); // the absolute path is the same file
+			expect(notes(h).length).toBe(1);
+			writeSpec(dir, `${specText("every route")}\n- One more unit.\n`);
+			await written(h, SPEC_REL, "edit", "w4");
+			expect(notes(h).length).toBe(2);
+		});
+
+		test("the dedupe is the session's: a session switch or a branch navigation forgets it", async () => {
+			const { h, dir } = await session();
+			writeSpec(dir, specText("every route"));
+			await written(h);
+			await h.fire("session_switch", { reason: "new" });
+			await written(h, SPEC_REL, "write", "w2");
+			expect(notes(h).length).toBe(2);
+			await h.fire("session_tree", { newLeafId: "x", oldLeafId: "y" });
+			await written(h, SPEC_REL, "write", "w3");
+			expect(notes(h).length).toBe(3);
+			// A failed send is not spent: the next write of the same content tries again.
+			h.sendThrows = true;
+			await h.fire("session_switch", { reason: "new" });
+			await written(h, SPEC_REL, "write", "w4");
+			h.sendThrows = false;
+			await written(h, SPEC_REL, "write", "w5");
+			expect(notes(h).length).toBe(4);
+		});
+
+		test("an approved spec, a file that is no spec, another path, and an errored write get none", async () => {
+			const { h, dir } = await session();
+			writeSpec(dir, specText("every route", "<!-- APPROVED 2026-10-01 -->"));
+			await written(h);
+			writeSpec(dir, "just some notes\n\nnothing to see", "notes/x.md");
+			await written(h, "notes/x.md", "write", "w2");
+			writeSpec(dir, specText("every route"), "docs/specs/flag.md");
+			await written(h, "docs/specs/flag.md", "write", "w3");
+			writeSpec(dir, specText("every route"), ".omp/pipeline/specs/deeper/flag.md");
+			await written(h, ".omp/pipeline/specs/deeper/flag.md", "write", "w4");
+			writeSpec(dir, specText("every route"));
+			await toolResult(h, "write", "w5", { path: SPEC_REL, content: "x" }, "failed", { isError: true });
+			await toolResult(h, "bash", "w6", { command: `cat ${SPEC_REL}` });
+			expect(h.sent).toEqual([]);
+		});
+
+		test("edit and apply_patch results are checked too, by the path in their input", async () => {
+			const { h, dir } = await session();
+			writeSpec(dir, specText("every route"));
+			await toolResult(h, "edit", "e1", { input: `[${SPEC_REL}#A1B2]\nPUT 3.=1:\n+x` });
+			expect(notes(h).length).toBe(1);
+			await h.fire("session_switch", { reason: "new" });
+			await toolResult(h, "apply_patch", "e2", { input: `*** Begin Patch\n*** Update File: ${SPEC_REL}\n@@\n+x\n*** End Patch` });
+			expect(notes(h).length).toBe(2);
+		});
+
+		test("it fails open: a missing file, an unreadable branch, and a throwing send leave the tool result alone", async () => {
+			const { h, dir } = await session();
+			expect(await written(h)).toBeUndefined(); // no such file yet
+			expect(h.sent).toEqual([]);
+			writeSpec(dir, specText("every route"));
+			h.ctx.sessionManager.getBranch = () => {
+				throw new Error("branch exploded");
+			};
+			expect(await written(h, SPEC_REL, "write", "w2")).toBeUndefined();
+			expect(h.sent).toEqual([]);
+			h.ctx.sessionManager.getBranch = () => [userMsg("ok")];
+			h.sendThrows = true;
+			expect(await written(h, SPEC_REL, "write", "w3")).toBeUndefined();
+			expect(h.warns.some((w) => w.includes("sendMessage failed"))).toBe(true);
+		});
+
+		test("pipeline.specChecks false sends none, and /adversary off does not silence it", async () => {
+			const off = await session({ pipeline: { specChecks: false } });
+			writeSpec(off.dir, specText("every route"));
+			await written(off.h);
+			expect(off.h.sent).toEqual([]);
+			expect(await status(off.h)).toContain("spec checks off (notes sent=0)");
+
+			const { h, dir } = await session();
+			await h.command("adversary", "off");
+			writeSpec(dir, specText("every route"));
+			await written(h);
+			expect(notes(h).length).toBe(1);
+		});
+
+		test("it works without a key, and the review of the write still runs after it", async () => {
+			mockState.apiKey = false;
+			const nokey = await session();
+			writeSpec(nokey.dir, specText("every route"));
+			await written(nokey.h);
+			expect(notes(nokey.h).length).toBe(1);
+
+			mockState.apiKey = true;
+			const reviewing = await session({ adversary: { enabled: true } });
+			await reviewing.h.fire("turn_start", { turnIndex: 0 });
+			replies.review = reviewAnswers("action", "adversarial", 1.7, { breaks_contract: 0.9 });
+			writeSpec(reviewing.dir, specText("every route"));
+			const out = await written(reviewing.h);
+			expect(notes(reviewing.h).length).toBe(1);
+			expect(reviewCalls().length).toBe(1);
+			expect(out?.content).toBeDefined(); // the review's inline note, as for any other write
+		});
+
+		test("a subagent's write is not checked, and its file is not read", async () => {
+			const { h, dir } = await session();
+			writeSpec(dir, specText("every route"));
+			const out = await h.fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: SPEC_REL, content: "x" }, content: [{ type: "text", text: "ok" }], isError: false }, subCtx(h, [userMsg("sub task")]));
+			expect(out).toBeUndefined();
+			expect(h.sent).toEqual([]);
+		});
+	});
+
+	describe("approval guard", () => {
+		const SPEC_REL = ".omp/pipeline/specs/flag.md";
+		const PRD_REL = ".omp/pipeline/prd.json";
+		const call = (name: string, input: unknown) => ({ type: "toolCall", id: `c-${name}`, name, arguments: input });
+		const assistant = (...calls: unknown[]) => ({ type: "message", message: { role: "assistant", content: calls } });
+		const result = (toolName: string, text: string, extra: Record<string, unknown> = {}) => ({ type: "message", message: { role: "toolResult", toolName, isError: false, content: [{ type: "text", text }], ...extra } });
+		const askAnswer = (selected: string[], extra: Record<string, unknown> = {}) =>
+			result("ask", `User selected: ${selected.join(", ")}`, { details: { question: "Approve this spec?", options: ["Request changes", "Approve", "Cancel"], multi: false, selectedOptions: selected, ...extra } });
+		const DRAFT = [assistant(call("write", { path: SPEC_REL, content: "<!-- UNAPPROVED DRAFT -->\n# Spec" })), result("write", "ok")];
+		const flipSpec = { toolName: "edit", toolCallId: "f1", input: { path: SPEC_REL, old_string: "<!-- UNAPPROVED DRAFT -->", new_string: "<!-- APPROVED 2026-10-01 -->" } };
+		const REASON = "Approval needs the user's exact Approve answer from the ask tool.";
+		const guarded = { pipeline: { approvalGuard: true } };
+
+		test("a flip with no answer behind it is blocked with the reason; it is off unless the config turns it on", async () => {
+			const on = setup(guarded, [...DRAFT], { hasUI: true });
+			await on.start();
+			expect(await on.fire("tool_call", flipSpec)).toEqual({ block: true, reason: REASON });
+			expect(await status(on)).toContain("approval guard on (blocked=1, would block=0)");
+			expect(mockState.calls).toEqual([]);
+			expect(on.sent).toEqual([]);
+
+			const dflt = setup({}, [...DRAFT], { hasUI: true });
+			await dflt.start();
+			expect(await dflt.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(await status(dflt)).toContain("approval guard off (blocked=0, would block=0)");
+		});
+
+		test("a real Approve answer after the draft lets it through; anything else does not", async () => {
+			const approved = setup(guarded, [...DRAFT, askAnswer(["Approve"])], { hasUI: true });
+			await approved.start();
+			expect(await approved.fire("tool_call", flipSpec)).toBeUndefined();
+
+			const notApproving: [string, unknown[]][] = [
+				["request changes", [askAnswer(["Request changes"])]],
+				["a cancelled ask", [result("ask", "Ask tool was cancelled by the user", { isError: true, details: {} })]],
+				["a typed answer", [askAnswer([], { customInput: "Approve" })]],
+				["a default picked on timeout", [askAnswer(["Approve"], { timedOut: true })]],
+				["an answer given before the draft was last written", [askAnswer(["Approve"]), ...DRAFT]],
+			];
+			for (const [name, tail] of notApproving) {
+				const h = setup(guarded, [...DRAFT, ...tail], { hasUI: true });
+				await h.start();
+				expect((await h.fire("tool_call", flipSpec))?.block, name).toBe(true);
+			}
+		});
+
+		test("the PRD flag and approve_file are guarded the same way", async () => {
+			const prdDraft = [assistant(call("write", { path: PRD_REL, content: '{ "approved": false }' })), result("write", "ok")];
+			const flipPrd = { toolName: "write", toolCallId: "f2", input: { path: PRD_REL, content: '{ "approved": true }' } };
+			const cell = { toolName: "eval", toolCallId: "f3", input: { language: "py", code: `approve_file("${PRD_REL}")` } };
+			const blocked = setup(guarded, [...prdDraft], { hasUI: true });
+			await blocked.start();
+			expect((await blocked.fire("tool_call", flipPrd))?.block).toBe(true);
+			expect((await blocked.fire("tool_call", cell))?.block).toBe(true);
+
+			const answered = setup(guarded, [...prdDraft, askAnswer(["Approve"])], { hasUI: true });
+			await answered.start();
+			expect(await answered.fire("tool_call", flipPrd)).toBeUndefined();
+			expect(await answered.fire("tool_call", cell)).toBeUndefined();
+		});
+
+		test("a call that approves nothing goes through: a draft write, another file, other tools", async () => {
+			const h = setup(guarded, [], { hasUI: true });
+			await h.start();
+			const through = async (event: Record<string, unknown>) => expect(await h.fire("tool_call", event)).toBeUndefined();
+			await through({ toolName: "write", toolCallId: "a", input: { path: SPEC_REL, content: "<!-- UNAPPROVED DRAFT -->\n# Spec" } });
+			await through({ toolName: "write", toolCallId: "b", input: { path: "notes.md", content: "<!-- APPROVED 2026-10-01 -->" } });
+			await through({ toolName: "edit", toolCallId: "c", input: { path: PRD_REL, old_string: "a", new_string: "b" } });
+			await through({ toolName: "eval", toolCallId: "d", input: { language: "py", code: "print(1)" } });
+			await through({ toolName: "bash", toolCallId: "e", input: { command: `echo '<!-- APPROVED 2026-10-01 -->' > ${SPEC_REL}` } });
+			await through({ toolName: "write", toolCallId: "f", input: { path: "xd://propose", content: "# Plan" } });
+			await through({ toolName: "write", toolCallId: "g" });
+		});
+
+		test("headless there is no ask tool to answer: the flip goes through and is recorded as would block", async () => {
+			const h = setup(guarded, [...DRAFT]);
+			await h.start();
+			const infos: string[] = [];
+			h.pi.logger.info = (message: string) => infos.push(message);
+			expect(await h.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(infos.some((line) => line.includes("would block spec approval (no ask tool)") && line.includes(REASON))).toBe(true);
+			expect(await status(h)).toContain("approval guard on (blocked=0, would block=1)");
+			// With the ask tool active the same session blocks.
+			h.activeTools = ["ask", "write", "edit"];
+			expect((await h.fire("tool_call", flipSpec))?.block).toBe(true);
+		});
+
+		test("a dag state flip takes the Run answer of its gate", async () => {
+			const DAG_REL = ".omp/pipeline/dag/login.json";
+			const draft = [assistant(call("write", { path: DAG_REL, content: '{ "approved": false }' })), result("write", "ok")];
+			const flip = { toolName: "write", toolCallId: "f", input: { path: DAG_REL, content: '{ "approved": true }' } };
+			const gate = (selected: string) => result("ask", `User selected: ${selected}`, { details: { question: "Run this DAG?", options: ["Edit", "Run", "Cancel"], multi: false, selectedOptions: [selected] } });
+			const refused = setup(guarded, [...draft], { hasUI: true });
+			await refused.start();
+			expect(await refused.fire("tool_call", flip)).toEqual({ block: true, reason: "Approval needs the user's exact Run answer from the ask tool." });
+			const run = setup(guarded, [...draft, gate("Run")], { hasUI: true });
+			await run.start();
+			expect(await run.fire("tool_call", flip)).toBeUndefined();
+		});
+
+		test("it fails open: an unreadable branch, and an ask result in a shape it cannot read", async () => {
+			const h = setup(guarded, [...DRAFT], { hasUI: true });
+			await h.start();
+			h.ctx.sessionManager.getBranch = () => {
+				throw new Error("branch exploded");
+			};
+			expect(await h.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(h.warns.some((w) => w.includes("approval guard failed: branch exploded"))).toBe(true);
+
+			const odd = setup(guarded, [...DRAFT, result("ask", "", { details: { somethingNew: true } })], { hasUI: true });
+			await odd.start();
+			expect(await odd.fire("tool_call", flipSpec)).toBeUndefined();
+		});
+
+		// The guard runs synchronously in `tool_call`, before the tool, on omp's one thread, over text the model wrote and a result's
+		// text. Quadratic scans of it stalled the host for seconds (see the approval scans in test/pipeline/approval.test.ts).
+		test("a hostile eval cell, one already in the branch and an ask result full of note openers are read in bounded time", async () => {
+			const hostile = { language: "py", code: `approve_file("${"a".repeat(30_000)}" + x)` };
+			const openers = result("ask", `User answers:\nq1: x${" (note: ".repeat(20_000)}`);
+			const h = setup(guarded, [assistant(call("eval", hostile)), result("eval", "ok"), openers], { hasUI: true });
+			await h.start();
+			const started = performance.now();
+			const out = await h.fire("tool_call", { toolName: "eval", toolCallId: "e1", input: hostile });
+			expect(performance.now() - started).toBeLessThan(250);
+			// Nothing in the branch is the user's Approve, so the call is stopped, as it would be for a short cell.
+			expect(out?.block).toBe(true);
+		});
+
+		test("a subagent's flip is not checked", async () => {
+			const h = setup(guarded, [...DRAFT], { hasUI: true });
+			await h.start();
+			expect(await h.fire("tool_call", flipSpec, subCtx(h, [...DRAFT]))).toBeUndefined();
+			expect(await status(h)).toContain("approval guard on (blocked=0, would block=0)");
+		});
+
+		test("the plan guard goes first: a dag cell in plan mode is blocked for its plan reason", async () => {
+			const h = setup(guarded, [planMode()], { hasUI: true });
+			await h.start();
+			const out = await h.fire("tool_call", { toolName: "eval", toolCallId: "e", input: { language: "py", code: `approve_file("${PRD_REL}")\nawait run_dag(state_path=x)` } });
+			expect(out?.reason).toContain("run_dag() cannot run in plan mode");
+		});
+	});
+
+	test("/adversary status lists the pipeline features, with their defaults", async () => {
+		const h = setup({}, []);
+		await h.start();
+		const text = await status(h);
+		expect(text).toContain("pipeline guards: plan guard on (blocked=0); approval guard off (blocked=0, would block=0)");
+		expect(text).toContain("pipeline checks: spec checks on (notes sent=0); skill-aware on (deep-interview,ralplan,dag)");
+		const none = setup({ pipeline: { skills: [] } }, []);
+		await none.start();
+		expect(await status(none)).toContain("skill-aware on (no skills)");
 	});
 });

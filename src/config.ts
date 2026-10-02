@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_PIPELINE_SKILLS } from "./pipeline/skill";
 import { isRecord } from "./text";
 
 /**
@@ -47,6 +48,37 @@ export interface AmbiguityGateSettings {
 	timeoutMs: number;
 }
 
+/**
+ * Features for the omp-skills pipeline (deep-interview -> spec, ralplan -> PRD, dag -> run). All of them are local:
+ * none calls Jev, and none sends anything off the machine.
+ */
+export interface PipelineSettings {
+	/**
+	 * Block an eval cell that calls run_dag() or prepare_dag() while plan mode is on: its workers are read-only there. On by
+	 * default, and it does not check that omp-skills is installed: any plan-mode Python cell with such a call is blocked,
+	 * a function of that name from other code included.
+	 */
+	planGuard: boolean;
+	/**
+	 * A prompt that runs one of `skills` is that skill's own turn: the ambiguity gate stays silent. Any skill the user invoked
+	 * is their turn: reviews, the stop gate and the gate take its args (`details.args`) as the task. Off, none of that
+	 * is read and only a user message is a turn, as before the pipeline features (see userTurnText).
+	 */
+	skillAware: boolean;
+	/**
+	 * Skill names `skillAware` recognizes, as omp names them (`deep-interview`, or `<namespace>/<name>`). A bare name also
+	 * matches that skill under any namespace; a namespaced entry matches only that one (see isPipelineSkill).
+	 */
+	skills: string[];
+	/**
+	 * Check a deep-interview spec when it is written, and send the model one note about what is wrong. Advisory. The note is an
+	 * aside, not `nextTurn`: it must reach the model's next step, which is the one that asks for approval.
+	 */
+	specChecks: boolean;
+	/** Block an approval (a spec's APPROVED marker, a PRD or DAG `approved: true`, `approve_file(`) the user never answered. Off by default: it blocks. */
+	approvalGuard: boolean;
+}
+
 export type TypesafeRole = "adversarial" | "advisory";
 export type TypesafePhase = "plan" | "execute";
 
@@ -57,6 +89,7 @@ export interface TypesafeConfig {
 	adversary: AdversarySettings;
 	stopGate: StopGateSettings;
 	ambiguityGate: AmbiguityGateSettings;
+	pipeline: PipelineSettings;
 }
 
 export const DEFAULT_CONFIG: TypesafeConfig = {
@@ -93,6 +126,7 @@ export const DEFAULT_CONFIG: TypesafeConfig = {
 		blockPropose: true,
 		timeoutMs: 2500,
 	},
+	pipeline: { planGuard: true, skillAware: true, skills: [...DEFAULT_PIPELINE_SKILLS], specChecks: true, approvalGuard: false },
 };
 
 type Env = Record<string, string | undefined>;
@@ -145,8 +179,8 @@ export function subagentGuardEnabled(env: Env = process.env): boolean {
 }
 
 /**
- * Apply TYPESAFE_ROLE / TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE / TYPESAFE_AMBIGUITY_THRESHOLD
- * on top of a merged config. Env wins over file. Values are trimmed and case-insensitive; anything
+ * Apply TYPESAFE_ROLE / TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE / TYPESAFE_AMBIGUITY_THRESHOLD /
+ * TYPESAFE_PIPELINE_GUARD on top of a merged config. Env wins over file. Values are trimmed and case-insensitive; anything
  * unrecognized is ignored with a warning instead of silently. TYPESAFE_SUBAGENT_GUARD is not applied (it is no
  * config value, see subagentGuardEnabled) but is checked here so that a typo is warned about at session start.
  * Pure function so it is independently testable; TYPESAFE_CONFIG is handled separately in
@@ -169,6 +203,11 @@ export function applyEnvOverrides(cfg: TypesafeConfig, env: Env = process.env, w
 	const gate = envBool("TYPESAFE_AMBIGUITY_GATE", env.TYPESAFE_AMBIGUITY_GATE, warn);
 	if (gate !== undefined) {
 		out = { ...out, ambiguityGate: { ...out.ambiguityGate, enabled: gate } };
+	}
+	// The kill switch for the plan guard, which blocks a tool call: it must work without editing the file.
+	const planGuard = envBool("TYPESAFE_PIPELINE_GUARD", env.TYPESAFE_PIPELINE_GUARD, warn);
+	if (planGuard !== undefined) {
+		out = { ...out, pipeline: { ...out.pipeline, planGuard } };
 	}
 	const thresholdRaw = env.TYPESAFE_AMBIGUITY_THRESHOLD?.trim();
 	if (thresholdRaw) {
@@ -266,6 +305,21 @@ function toolsArr(v: unknown, fallback: string[], warn?: Warn): string[] {
 	return [...out];
 }
 
+/**
+ * Skill names: trimmed, each once. As with `adversary.tools`, an explicit empty array means "no skill" and the fallback
+ * applies when the key is absent, is not an array, or holds nothing usable. Names are case-sensitive and kept as written
+ * (see isPipelineSkill for what a bare and a namespaced name match).
+ */
+function skillsArr(v: unknown, fallback: string[], warn?: Warn): string[] {
+	if (!Array.isArray(v)) return [...fallback];
+	const out = [...new Set(v.filter((x): x is string => typeof x === "string").map((x) => x.trim()).filter((x) => x.length > 0))];
+	if (v.length > 0 && out.length === 0) {
+		warn?.("pipeline.skills has no usable entries; using the default list");
+		return [...fallback];
+	}
+	return out;
+}
+
 function roleVal(v: unknown, fallback: TypesafeRole): TypesafeRole {
 	return v === "adversarial" || v === "advisory" ? v : fallback;
 }
@@ -330,10 +384,12 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 	const adv = (typeof o.adversary === "object" && o.adversary !== null ? o.adversary : {}) as Record<string, unknown>;
 	const gate = (typeof o.stopGate === "object" && o.stopGate !== null ? o.stopGate : {}) as Record<string, unknown>;
 	const amb = (typeof o.ambiguityGate === "object" && o.ambiguityGate !== null ? o.ambiguityGate : {}) as Record<string, unknown>;
+	const pipe = (typeof o.pipeline === "object" && o.pipeline !== null ? o.pipeline : {}) as Record<string, unknown>;
 	const ambWeights = (typeof amb.weights === "object" && amb.weights !== null ? amb.weights : {}) as Record<string, unknown>;
 	const a = base.adversary;
 	const g = base.stopGate;
 	const ag = base.ambiguityGate;
+	const pl = base.pipeline;
 	const [concernSeverity, blockerSeverity] = orderSeverities(
 		num(adv.concern_severity, a.concern_severity, 0, 3),
 		num(adv.blocker_severity, a.blocker_severity, 0, 3),
@@ -387,6 +443,13 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 			maxAsksPerPlan: Math.trunc(num(amb.maxAsksPerPlan, ag.maxAsksPerPlan, 0, 32)),
 			blockPropose: bool(amb.blockPropose, ag.blockPropose),
 			timeoutMs: Math.trunc(num(amb.timeoutMs, ag.timeoutMs, 250, 60_000)),
+		},
+		pipeline: {
+			planGuard: bool(pipe.planGuard, pl.planGuard),
+			skillAware: bool(pipe.skillAware, pl.skillAware),
+			skills: skillsArr(pipe.skills, pl.skills, warn),
+			specChecks: bool(pipe.specChecks, pl.specChecks),
+			approvalGuard: bool(pipe.approvalGuard, pl.approvalGuard),
 		},
 	};
 }

@@ -47,6 +47,20 @@ const GENERATED_EXCLUDES = [
 	":(exclude)*.map",
 ];
 const WHOLE_TREE = [".", ...GENERATED_EXCLUDES];
+/**
+ * omp-skills keeps a pipeline run's state (specs, the PRD, DAG state) under `.omp/pipeline`, in the repo it works on:
+ * files the runner and the critic write and that are not the agent's changes. `top` and `glob` make the one pathspec
+ * match it at any depth, from any working directory, and nothing that merely starts with `.omp`. It goes to the diff and
+ * grep probes, which always carry a pathspec; `git status` does not (see PIPELINE_STATE_PATH).
+ */
+const PIPELINE_STATE_EXCLUDE = ":(top,exclude,glob)**/.omp/pipeline/**";
+/**
+ * The same files, as a repo-root-relative path (which is how porcelain `git status` writes every path). `git status` is
+ * filtered by it after the fact and never given a pathspec: an exclusion-only pathspec is read literally under
+ * GIT_LITERAL_PATHSPECS and before git 2.13, and shows nothing at all there. An action's own file there is no focus either.
+ */
+const PIPELINE_STATE_PATH = /(?:^|\/)\.omp\/pipeline(?:\/|$)/;
+
 const GENERATED_FILE = /(?:\.lock|\.lockb|-lock\.json|-lock\.yaml|go\.sum|\.min\.js|\.min\.css|\.map)$/;
 
 export interface Suspect {
@@ -86,6 +100,8 @@ export interface CollectOptions {
 	signal?: AbortSignal;
 	/** Mask obvious secrets in evidence text. Default true. */
 	redact?: boolean;
+	/** Leave `.omp/pipeline` (an omp-skills run's state) out of every status, diff and grep probe. Default false. */
+	excludePipeline?: boolean;
 }
 
 export interface ActionDetail {
@@ -311,12 +327,13 @@ export function suspectIdentifiers(unifiedDiff: string, max: number = MAX_SUSPEC
 // Collection
 // ---------------------------------------------------------------------------
 
-/** Porcelain v1 `-z` output as readable `XY path` lines plus the untracked paths and the full count. */
-function parseStatus(raw: string): { text: string; count: number; untracked: string[] } {
+/** Porcelain v1 `-z` output as readable `XY path` lines plus the untracked paths and the full count; `.omp/pipeline` is dropped when asked. */
+function parseStatus(raw: string, excludePipeline?: boolean): { text: string; count: number; untracked: string[] } {
 	const lines: string[] = [];
 	const untracked: string[] = [];
 	for (const entry of splitNul(raw)) {
 		if (entry.length < 4) continue;
+		if (excludePipeline === true && PIPELINE_STATE_PATH.test(entry.slice(3))) continue;
 		lines.push(entry);
 		if (entry.startsWith("??")) untracked.push(entry.slice(3));
 	}
@@ -375,12 +392,12 @@ export async function captureBaseline(pi: ExecLike, cwd: string | undefined, sig
 export async function collectStatus(
 	pi: ExecLike,
 	cwd: string | undefined,
-	opts: { signal?: AbortSignal; redact?: boolean } = {},
+	opts: { signal?: AbortSignal; redact?: boolean; excludePipeline?: boolean } = {},
 ): Promise<StatusEvidence> {
 	const raw = await makeProbe(pi, opts.signal)(cwd, STATUS_ARGS);
 	if (raw === null) return { repo: false, incomplete: true };
 	if (raw.code !== 0) return { repo: false };
-	const parsed = parseStatus(raw.stdout);
+	const parsed = parseStatus(raw.stdout, opts.excludePipeline);
 	return { repo: true, status: cleanedCap(parsed.text, 1000, makeClean(opts.redact)), changedCount: parsed.count };
 }
 
@@ -390,6 +407,7 @@ export async function collectEvidence(pi: ExecLike, cwd: string | undefined, opt
 	const probe = makeProbe(pi, opts.signal);
 	const clean = makeClean(opts.redact);
 	const incomplete: string[] = [];
+	const wholeTree = opts.excludePipeline === true ? [...WHOLE_TREE, PIPELINE_STATE_EXCLUDE] : WHOLE_TREE;
 
 	const pinned = validBaseline(opts.baseline) ? opts.baseline : undefined;
 	const [top, head, statusRaw] = await Promise.all([
@@ -411,18 +429,18 @@ export async function collectEvidence(pi: ExecLike, cwd: string | undefined, opt
 	}
 
 	const statusOut = okOut(statusRaw);
-	const status = statusOut === null ? null : parseStatus(statusOut);
+	const status = statusOut === null ? null : parseStatus(statusOut, opts.excludePipeline);
 	if (!status) incomplete.push("status");
 
-	const focus = focusCandidates(opts.focusPaths, cwd, root, prefixLine);
+	const focus = focusCandidates(opts.focusPaths, cwd, root, prefixLine).filter((f) => opts.excludePipeline !== true || !PIPELINE_STATE_PATH.test(f));
 	const [statRaw, namesRaw, scopedRaw] = await Promise.all([
-		probe(root, ["diff", base, "--stat", ...DIFF_FLAGS, "--", ...WHOLE_TREE]),
-		probe(root, ["diff", base, "--name-only", "-z", ...DIFF_FLAGS, "--", ...WHOLE_TREE]),
-		probe(root, ["diff", base, "-U0", ...DIFF_FLAGS, "--", ...(focus.length > 0 ? focus.map((f) => `:(literal)${f}`) : WHOLE_TREE)]),
+		probe(root, ["diff", base, "--stat", ...DIFF_FLAGS, "--", ...wholeTree]),
+		probe(root, ["diff", base, "--name-only", "-z", ...DIFF_FLAGS, "--", ...wholeTree]),
+		probe(root, ["diff", base, "-U0", ...DIFF_FLAGS, "--", ...(focus.length > 0 ? focus.map((f) => `:(literal)${f}`) : wholeTree)]),
 	]);
 	// The action's own file scopes the removed-name probe; fall back to the whole tree when it shows nothing.
 	let zero = okOut(scopedRaw);
-	if (focus.length > 0 && !zero) zero = okOut(await probe(root, ["diff", base, "-U0", ...DIFF_FLAGS, "--", ...WHOLE_TREE]));
+	if (focus.length > 0 && !zero) zero = okOut(await probe(root, ["diff", base, "-U0", ...DIFF_FLAGS, "--", ...wholeTree]));
 	if (zero === null) incomplete.push("suspects");
 	const statOut = okOut(statRaw);
 	if (statOut === null) incomplete.push("diffStat");
@@ -448,7 +466,7 @@ export async function collectEvidence(pi: ExecLike, cwd: string | undefined, opt
 		Promise.all(
 			ids.map((id) =>
 				// Exit 1 is "no match". -w/-F keep substrings (fetchUsername) out, -I skips binaries.
-				probe(root, ["grep", "--no-color", "-I", "-n", "-w", "-F", "--untracked", "-e", id, "--", ...WHOLE_TREE]).then((r) => okOut(r, [0, 1])),
+				probe(root, ["grep", "--no-color", "-I", "-n", "-w", "-F", "--untracked", "-e", id, "--", ...wholeTree]).then((r) => okOut(r, [0, 1])),
 			),
 		),
 	]);

@@ -91,7 +91,11 @@ export interface HostMessage {
 }
 
 export interface SendMessageOptions {
-	/** `aside` and `nextTurn` queue the message without wanting a reply; `steer` interrupts the running turn. */
+	/**
+	 * `aside` is injected at the next step boundary of the running turn, without interrupting its tool batch (it starts a
+	 * turn when the session is idle); `nextTurn` stays hidden until the user's next prompt and never wakes an idle agent;
+	 * `steer` interrupts the running turn.
+	 */
 	deliverAs?: "aside" | "steer" | "nextTurn" | "followUp";
 	triggerTurn?: boolean;
 }

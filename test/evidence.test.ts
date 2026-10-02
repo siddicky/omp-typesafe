@@ -607,6 +607,87 @@ describe("what counts as a change", () => {
 	});
 });
 
+// omp-skills keeps a run's specs, PRD and DAG state under .omp/pipeline; with `excludePipeline` none of the probes sees it.
+describe("excludePipeline: a pipeline run's state is not the agent's change", () => {
+	const SRC = "export function fetchUser() {}\n";
+	function pipelineRepo(): string {
+		const dir = makeRepo({ "src/x.ts": SRC, ".omp/pipeline/prd.json": '{ "stories": [] }\n', "pkg/.omp/pipeline/dag/x.json": '{ "nodes": [] }\n' });
+		write(dir, {
+			"src/x.ts": SRC.replace("fetchUser", "getUser"),
+			".omp/pipeline/prd.json": '{ "stories": [1] }\n',
+			"pkg/.omp/pipeline/dag/x.json": '{ "nodes": [1] }\n',
+			// Untracked, and mentioning the removed name.
+			".omp/pipeline/specs/flag.md": "<!-- UNAPPROVED DRAFT -->\nrename fetchUser\n",
+			// Not the pipeline directory, only a name that starts like it.
+			".ompx/pipeline/keep.txt": "kept\n",
+		});
+		return dir;
+	}
+
+	test("status, the change count, the diffs and the removed-name grep leave it out, at any depth", async () => {
+		const ev = await collectEvidence(realExec(), pipelineRepo(), { excludePipeline: true });
+		expect(ev.status).toBe(" M src/x.ts\n?? .ompx/pipeline/keep.txt");
+		expect(ev.changedCount).toBe(2);
+		expect(ev.diffStat).toContain("src/x.ts");
+		expect(JSON.stringify(ev)).not.toContain(".omp/pipeline");
+		expect(JSON.stringify(ev)).not.toContain("prd.json");
+		// The only other place the removed name appears is the untracked spec, so nothing is left to flag.
+		expect(ev.suspects).toEqual([]);
+	});
+
+	test("without it they are all there: it is opt-in", async () => {
+		const ev = await collectEvidence(realExec(), pipelineRepo());
+		expect(ev.changedCount).toBe(5);
+		expect(ev.status).toContain(".omp/pipeline/prd.json");
+		expect(ev.status).toContain("pkg/.omp/pipeline/dag/x.json");
+		expect(ev.status).toContain(".omp/pipeline/specs/flag.md");
+		expect(ev.suspects?.[0].hits.some((hit) => hit.includes(".omp/pipeline/specs/flag.md"))).toBe(true);
+	});
+
+	test("from a subdirectory too, and for the status-only probe", async () => {
+		const dir = pipelineRepo();
+		const nested = await collectEvidence(realExec(), join(dir, "pkg"), { excludePipeline: true });
+		expect(nested.changedCount).toBe(2);
+		const status = await collectStatus(realExec(), join(dir, "pkg"), { excludePipeline: true });
+		expect(status).toEqual({ repo: true, status: " M src/x.ts\n?? .ompx/pipeline/keep.txt", changedCount: 2 });
+		expect((await collectStatus(realExec(), dir)).changedCount).toBe(5);
+	});
+
+	test("git status carries no pathspec: the base command, filtered after the fact, so a literal-pathspec environment still sees every change", async () => {
+		const dir = pipelineRepo();
+		const log: string[] = [];
+		const on = await collectStatus(realExec({}, log), dir, { excludePipeline: true });
+		const status = log.find((line) => line.startsWith("git") && line.includes(" status "));
+		expect(status).toBeDefined();
+		expect(status).not.toContain(" -- ");
+		expect(status).not.toContain("exclude");
+		expect(on).toEqual({ repo: true, status: " M src/x.ts\n?? .ompx/pipeline/keep.txt", changedCount: 2 });
+		// GIT_LITERAL_PATHSPECS (and git before 2.13) read an exclusion-only pathspec literally, which matches nothing: the
+		// status would have come back empty with the pathspec on.
+		const literal = { GIT_LITERAL_PATHSPECS: "1" };
+		expect(await collectStatus(realExec(literal), dir, { excludePipeline: true })).toEqual(on);
+		expect((await collectEvidence(realExec(literal), dir, { excludePipeline: true })).changedCount).toBe(2);
+		const probe = Bun.spawnSync(["git", "--no-optional-locks", "status", "--porcelain", "-z", "-uall", "--no-renames", "--", ":(top,exclude,glob)**/.omp/pipeline/**"], {
+			cwd: dir,
+			env: { ...process.env, ...GIT_ENV, ...literal },
+			stdout: "pipe",
+		});
+		expect(probe.stdout.toString()).toBe("");
+	});
+
+	test("an action's own file there is no focus, and a repo with nothing else changed reports nothing", async () => {
+		const dir = pipelineRepo();
+		const ev = await collectEvidence(realExec(), dir, { excludePipeline: true, focusPaths: [".omp/pipeline/prd.json", join(dir, ".omp/pipeline/specs/flag.md")] });
+		expect(JSON.stringify(ev.fileDiffs)).not.toContain("prd.json");
+		expect(ev.changedCount).toBe(2);
+		const only = makeRepo({ "src/x.ts": SRC });
+		write(only, { ".omp/pipeline/specs/flag.md": "draft\n" });
+		const quiet = await collectEvidence(realExec(), only, { excludePipeline: true });
+		expect(quiet).toMatchObject({ repo: true, changedCount: 0 });
+		expect(quiet.status).toBe("");
+	});
+});
+
 describe("repoOutline", () => {
 	test("counts every tracked file; only the rendered lists are trimmed", async () => {
 		const files: Record<string, string> = { "package.json": "{}\n", "tsconfig.json": "{}\n", "README.md": "# x\n" };

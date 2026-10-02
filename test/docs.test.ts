@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, mergeConfig, subagentGuardEnabled } from "../src/config";
+import { applyEnvOverrides, DEFAULT_CONFIG, mergeConfig, subagentGuardEnabled } from "../src/config";
 import { MAX_PROPOSE_BLOCKS } from "../src/ambiguity";
 import { SUSPECT_SCAN_BUDGET_MS } from "../src/evidence";
 import { TOTAL_CAP } from "../src/priorities";
+import { approvalBlockReason } from "../src/pipeline/approval";
+import { planGuardDecision, planGuardReason } from "../src/pipeline/plan-guard";
+import { scanBranch, userTurnText } from "../src/branch";
+import { DRAFT_MARKER, SPEC_NOTE_CUSTOM_TYPE } from "../src/pipeline/spec";
 import { isSubagentCtx } from "../src/subagent";
 import { MASK_GROWTH_LIMIT, MASK_HEADROOM } from "../src/text";
 import { HISTORY_CAP, MAX_CALLS_PER_PROMPT, MAX_MESSAGE_REVIEWS_PER_PROMPT, NOTE_DEDUPE_TTL_TURNS } from "../src/reviewer";
@@ -18,6 +22,8 @@ import { LIMITS } from "./limits";
 const root = join(import.meta.dir, "..");
 const read = (path: string): string => readFileSync(join(root, path), "utf8");
 const readme = read("README.md");
+/** Where the source modules live: src/, and src/pipeline/ for the omp-skills features. */
+const sourceDirs = ["src", "src/pipeline"];
 
 /** Bodies of the fenced ```json blocks that follow `heading`, up to the next heading of the same or higher level. */
 function jsonBlocksAfter(markdown: string, heading: string): unknown[] {
@@ -47,8 +53,10 @@ describe("README defaults match the code", () => {
 
 	test("every environment variable the source reads is in the README's environment table", () => {
 		const names = new Set<string>();
-		for (const file of readdirSync(join(root, "src")).filter((f) => f.endsWith(".ts"))) {
-			for (const match of read(join("src", file)).matchAll(/\b(TYPESAFE_[A-Z_]+|PI_CODING_AGENT_DIR)\b/g)) names.add(match[1]);
+		for (const dir of sourceDirs) {
+			for (const file of readdirSync(join(root, dir)).filter((f) => f.endsWith(".ts"))) {
+				for (const match of read(join(dir, file)).matchAll(/\b(TYPESAFE_[A-Z_]+|PI_CODING_AGENT_DIR)\b/g)) names.add(match[1]);
+			}
 		}
 		expect(names.size).toBeGreaterThan(5);
 		const table = readme.slice(readme.indexOf("### Environment"), readme.indexOf("### Review priorities"));
@@ -100,7 +108,7 @@ function tableRow(markdown: string, first: string): string {
 describe("README limits match the ones the code is tested against", () => {
 	test("what leaves the machine: every cap in the table", () => {
 		const action = tableRow(readme, "Action review");
-		expect(action).toContain(`last user message, ${LIMITS.task} chars`);
+		expect(action).toContain(`last user turn, ${LIMITS.task} chars`);
 		expect(action).toContain(`tool name and input (${LIMITS.toolInput})`);
 		expect(action).toContain(`tool result (${LIMITS.toolResult})`);
 		expect(action).toContain(`last claim (${LIMITS.claimedIntent})`);
@@ -247,7 +255,102 @@ describe("README documents the subagent guard", () => {
 
 	test("every source module is in the README's layout", () => {
 		const layout = readme.slice(readme.indexOf("## Layout"));
-		for (const file of readdirSync(join(root, "src")).filter((f) => f.endsWith(".ts"))) expect(layout, `src/${file}`).toContain(`src/${file} `);
+		for (const dir of sourceDirs) {
+			for (const file of readdirSync(join(root, dir)).filter((f) => f.endsWith(".ts"))) expect(layout, `${dir}/${file}`).toContain(`${dir}/${file} `);
+		}
+	});
+});
+
+describe("README documents the pipeline features", () => {
+	const start = readme.indexOf("\n## Pipeline (omp-skills)\n");
+	const rest = readme.slice(start + 1);
+	const section = rest.slice(0, rest.indexOf("\n## ", 1));
+	const flat = section.replace(/\s+/g, " ");
+	const { pipeline } = DEFAULT_CONFIG;
+	const word = (on: boolean): string => (on ? "on" : "**off**");
+
+	test("there is a section, and its table names each key with the default the code has", () => {
+		expect(start).toBeGreaterThanOrEqual(0);
+		expect(tableRow(section, "[Plan guard](#plan-guard)")).toContain(`| \`pipeline.planGuard\`, env \`TYPESAFE_PIPELINE_GUARD\` | ${word(pipeline.planGuard)} |`);
+		const skills = tableRow(section, "[Skill awareness](#skill-awareness)");
+		expect(skills).toContain("`pipeline.skillAware`, `pipeline.skills`");
+		expect(skills).toContain(`| ${word(pipeline.skillAware)}; ${pipeline.skills.map((name) => `\`${name}\``).join(", ")} |`);
+		expect(tableRow(section, "[Spec checks](#spec-checks)")).toContain(`| \`pipeline.specChecks\` | ${word(pipeline.specChecks)} |`);
+		expect(tableRow(section, "[Approval guard](#approval-guard)")).toContain(`| \`pipeline.approvalGuard\` | ${word(pipeline.approvalGuard)} |`);
+		// The two that are on by default are not the one that blocks only if asked.
+		expect([pipeline.planGuard, pipeline.skillAware, pipeline.specChecks, pipeline.approvalGuard]).toEqual([true, true, true, false]);
+	});
+
+	test("every pipeline key is in the configuration table", () => {
+		const configuration = readme.slice(readme.indexOf("## Configuration"), readme.indexOf("### Environment"));
+		// The table writes the first key of a row in full (`pipeline.planGuard`) and the rest bare, like the other sections.
+		for (const key of Object.keys(pipeline)) expect(configuration, key).toMatch(new RegExp(`\`(?:pipeline\\.)?${key}\``));
+	});
+
+	test("the words it states are the code's: the block reasons, the draft marker, the note's customType", () => {
+		expect(section).toContain(planGuardReason("run_dag"));
+		expect(section).toContain(`\`${approvalBlockReason(["Approve"])}\``);
+		expect(section).toContain(`\`${DRAFT_MARKER}\``);
+		expect(section).toContain(`\`${SPEC_NOTE_CUSTOM_TYPE}\``);
+		expect(section).toContain("deliverAs: \"aside\"");
+	});
+
+	test("the kill switch it names, and the words it lists, are the ones the code honours", () => {
+		for (const word of ["0", "false", "off", "no"]) {
+			expect(applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_GUARD: word }).pipeline.planGuard).toBe(false);
+		}
+		expect(flat).toContain("`TYPESAFE_PIPELINE_GUARD=0` (also `false`, `off`, `no`)");
+		expect(tableRow(readme, "`TYPESAFE_PIPELINE_GUARD`")).toContain("`pipeline.planGuard`");
+	});
+
+	// The plan guard reads the cell and the branch and nothing else, so it needs no omp-skills: that is what the README says.
+	test("the plan guard is on by default and blocks a plan-mode run_dag( cell with no omp-skills in sight; the README says so and how to turn it off", () => {
+		expect(DEFAULT_CONFIG.pipeline.planGuard).toBe(true);
+		expect(flat).toContain("On by default, whether or not omp-skills is installed");
+		expect(flat).toContain("blocks any Python `eval` cell that calls `run_dag(` or `prepare_dag(`");
+		const plan = scanBranch([{ type: "mode_change", mode: "plan" }, { type: "message", message: { role: "user", content: [{ type: "text", text: "run my own run_dag helper" }] } }]);
+		const ownCell = { language: "py", code: "from mylib import run_dag\nrun_dag(items)" };
+		expect(planGuardDecision(plan, "eval", ownCell, DEFAULT_CONFIG.pipeline).block).toBe(true);
+		// The config the README gives for turning it off does.
+		expect(flat).toContain('`"pipeline": { "planGuard": false }`');
+		const off = mergeConfig(DEFAULT_CONFIG, { pipeline: { planGuard: false } }).pipeline;
+		expect(planGuardDecision(plan, "eval", ownCell, off).block).toBe(false);
+		// And the config table does not call the other guard the only one that blocks.
+		expect(tableRow(readme, "`pipeline.planGuard`, `skillAware`, `specChecks`, `approvalGuard`")).toContain("`planGuard`, which is on by default");
+	});
+
+	test("what the README says pipeline.skillAware changes is what the branch helpers do with and without it", () => {
+		expect(flat).toContain("`details.args` of its `skill-prompt` entry");
+		expect(flat).toContain("`pipeline.skillAware: false` turns the whole feature off and restores the extension as it was without it, for every path");
+		expect(flat).toContain("the transcript delta has no `USER` line for it");
+		expect(flat).toContain("The [spec check](#spec-checks) has its own switch and still counts a skill's `args` as something you said");
+		const [skill] = scanBranch([{ type: "custom_message", customType: "skill-prompt", content: "(the skill's whole text)", display: true, attribution: "user", details: { name: "archify", args: "draw it", prompt: "/skill:archify draw it" } }]);
+		expect(userTurnText(skill, true)).toBe("draw it");
+		expect(userTurnText(skill, false)).toBe("");
+		expect(userTurnText(skill)).toBe("");
+		expect(tableRow(readme, "Action review")).toContain("with `pipeline.skillAware`, what you typed after a `/skill:` token");
+	});
+
+	// index.test.ts holds the code to `aside` (it sends it, and a tool result is always followed by a model step); this holds the README to the reason.
+	test("the spec note's channel and why: an aside for the next step, never nextTurn, which would arrive after the ask", () => {
+		expect(flat).toContain('It is sent as an aside (`deliverAs: "aside"`), which omp injects at the next step boundary of the running turn');
+		expect(flat).toContain("so the note reaches the model before it asks you to approve the spec; `nextTurn` would hold it until your next prompt, after the ask");
+		expect(flat).toContain("That is deliberate, and it is the [reviewer's rule](#delivery) for notes after a tool result");
+		// The rule it points to is in the Delivery section, in the same words.
+		expect(readme).toContain("it is used only where a model step is guaranteed to follow: after a tool result. `nextTurn` waits for\n  the next prompt and never wakes an idle agent.");
+	});
+
+	test("it says what none of the features does", () => {
+		expect(flat).toContain("None of them calls Jev, none sends anything off the machine, and none needs `TYPESAFE_API_KEY`");
+		expect(flat).toContain("None of them approves, writes or runs anything on your behalf");
+		expect(flat).toContain("**It never approves anything.**");
+		expect(flat).toContain("**Not a sandbox.**");
+		expect(flat).toContain("All of them are dormant in [subagent sessions](#subagents), and each one fails open");
+		expect(readme).toContain("The [pipeline features](#pipeline-omp-skills) are not in this table: they make no request.");
+	});
+
+	test("`/adversary status` has the two lines it says it has", () => {
+		expect(flat).toContain("`/adversary status` has a `pipeline guards` and a `pipeline checks` line");
 	});
 });
 

@@ -455,6 +455,66 @@ describe("mergeConfig — adversary.tools", () => {
 	});
 });
 
+describe("mergeConfig — pipeline", () => {
+	test("the defaults: the plan guard, skill awareness and spec checks on, the approval guard (it blocks) off", () => {
+		expect(DEFAULT_CONFIG.pipeline).toEqual({ planGuard: true, skillAware: true, skills: ["deep-interview", "ralplan", "dag"], specChecks: true, approvalGuard: false });
+		expect(mergeConfig(DEFAULT_CONFIG, {}).pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+	});
+
+	test("the file can change each switch, and a value that is not a boolean keeps the base value", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, { pipeline: { planGuard: false, skillAware: false, specChecks: false, approvalGuard: true } });
+		expect(cfg.pipeline).toEqual({ ...DEFAULT_CONFIG.pipeline, planGuard: false, skillAware: false, specChecks: false, approvalGuard: true });
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { planGuard: "no", skillAware: 0, specChecks: null, approvalGuard: "yes" } }).pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+		for (const pipeline of [null, "off", 3, []]) expect(mergeConfig(DEFAULT_CONFIG, { pipeline }).pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+	});
+
+	test("skills: names are trimmed and kept once, and what is not a name is dropped", () => {
+		const warnings: string[] = [];
+		const cfg = mergeConfig(DEFAULT_CONFIG, { pipeline: { skills: [" dag ", "dag", "acme/audit", 3, null, "", "Dag"] } }, (m) => warnings.push(m));
+		expect(cfg.pipeline.skills).toEqual(["dag", "acme/audit", "Dag"]);
+		expect(warnings).toEqual([]);
+	});
+
+	test("skills: an explicit empty array means none; an absent key, a non-array or nothing usable falls back to the default", () => {
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { skills: [] } }).pipeline.skills).toEqual([]);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: {} }).pipeline.skills).toEqual(DEFAULT_CONFIG.pipeline.skills);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { skills: "dag" } }).pipeline.skills).toEqual(DEFAULT_CONFIG.pipeline.skills);
+		const warnings: string[] = [];
+		const cfg = mergeConfig(DEFAULT_CONFIG, { pipeline: { skills: [1, "  ", null] } }, (m) => warnings.push(m));
+		expect(cfg.pipeline.skills).toEqual(DEFAULT_CONFIG.pipeline.skills);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("pipeline.skills");
+	});
+
+	test("the default list is copied, not shared", () => {
+		expect(mergeConfig(DEFAULT_CONFIG, {}).pipeline.skills).not.toBe(DEFAULT_CONFIG.pipeline.skills);
+		expect(defaultConfig({}).pipeline.skills).not.toBe(DEFAULT_CONFIG.pipeline.skills);
+	});
+});
+
+describe("applyEnvOverrides — TYPESAFE_PIPELINE_GUARD", () => {
+	test.each(["0", "false", "off", "no", " No ", "FALSE"])("=%j is the kill switch of the plan guard, and of nothing else", (value) => {
+		const out = applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_GUARD: value });
+		expect(out.pipeline).toEqual({ ...DEFAULT_CONFIG.pipeline, planGuard: false });
+		expect({ ...out, pipeline: DEFAULT_CONFIG.pipeline }).toEqual(DEFAULT_CONFIG);
+	});
+
+	test.each(["1", "true", "on", "yes", " Yes "])("=%j turns the guard on over a file that turned it off", (value) => {
+		const off = mergeConfig(DEFAULT_CONFIG, { pipeline: { planGuard: false } });
+		expect(applyEnvOverrides(off, { TYPESAFE_PIPELINE_GUARD: value }).pipeline.planGuard).toBe(true);
+	});
+
+	test("a value it cannot read warns and changes nothing; a blank one is silent", () => {
+		const warnings: string[] = [];
+		expect(applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_GUARD: "maybe" }, (m) => warnings.push(m))).toEqual(DEFAULT_CONFIG);
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("TYPESAFE_PIPELINE_GUARD");
+		warnings.length = 0;
+		expect(applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_GUARD: "  " }, (m) => warnings.push(m))).toEqual(DEFAULT_CONFIG);
+		expect(warnings).toEqual([]);
+	});
+});
+
 describe("defaultConfig", () => {
 	test("is a deep copy of the defaults", () => {
 		const cfg = defaultConfig({});
@@ -476,6 +536,7 @@ describe("loadConfig", () => {
 		TYPESAFE_DEFAULT_MODEL: process.env.TYPESAFE_DEFAULT_MODEL,
 		TYPESAFE_ROLE: process.env.TYPESAFE_ROLE,
 		TYPESAFE_AMBIGUITY_THRESHOLD: process.env.TYPESAFE_AMBIGUITY_THRESHOLD,
+		TYPESAFE_PIPELINE_GUARD: process.env.TYPESAFE_PIPELINE_GUARD,
 	};
 	const dir = mkdtempSync(join(tmpdir(), "omp-typesafe-config-"));
 	let n = 0;
@@ -513,7 +574,7 @@ describe("loadConfig", () => {
 	});
 
 	function clearOverrides(): void {
-		for (const key of ["TYPESAFE_REVIEW_ENABLED", "TYPESAFE_AMBIGUITY_GATE", "TYPESAFE_DEFAULT_MODEL", "TYPESAFE_ROLE", "TYPESAFE_AMBIGUITY_THRESHOLD"]) {
+		for (const key of ["TYPESAFE_REVIEW_ENABLED", "TYPESAFE_AMBIGUITY_GATE", "TYPESAFE_DEFAULT_MODEL", "TYPESAFE_ROLE", "TYPESAFE_AMBIGUITY_THRESHOLD", "TYPESAFE_PIPELINE_GUARD"]) {
 			delete process.env[key];
 		}
 	}
@@ -539,6 +600,28 @@ describe("loadConfig", () => {
 		expect(getConfigWarnings()).toHaveLength(1);
 		expect(getConfigWarnings()[0]).toContain("unreadable");
 		expect(warned).toHaveLength(1);
+	});
+
+	// The pipeline features make no paid call, so an unreadable file does not touch them: the guard that blocks stays at its
+	// default (on) and the opt-in one stays off.
+	test("a malformed file leaves the pipeline features at their defaults", async () => {
+		clearOverrides();
+		useConfigFile('{ "pipeline": { "planGuard": false, ');
+		const cfg = await loadConfig();
+		expect(cfg.adversary.enabled).toBe(false);
+		expect(cfg.pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+	});
+
+	test("TYPESAFE_PIPELINE_GUARD wins over the file, either way", async () => {
+		clearOverrides();
+		useConfigFile('{ "pipeline": { "planGuard": true } }');
+		process.env.TYPESAFE_PIPELINE_GUARD = "0";
+		expect((await loadConfig()).pipeline.planGuard).toBe(false);
+		useConfigFile('{ "pipeline": { "planGuard": false } }');
+		process.env.TYPESAFE_PIPELINE_GUARD = "1";
+		expect((await loadConfig()).pipeline.planGuard).toBe(true);
+		delete process.env.TYPESAFE_PIPELINE_GUARD;
+		expect((await loadConfig()).pipeline.planGuard).toBe(false);
 	});
 
 	test("a JSON file that is not an object also fails closed", async () => {

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { claimedIntent, lastUserText, PLAN_EXIT_MARKERS, PLAN_MODE_MARKERS, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch } from "../src/branch";
+import { claimedIntent, lastUserText, PLAN_EXIT_MARKERS, PLAN_MODE_MARKERS, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch, SKILL_PROMPT_TYPE, userTurnText } from "../src/branch";
 
 type Raw = Record<string, unknown>;
 
@@ -18,6 +18,23 @@ const toolResult = (toolName = "read"): Raw => ({
 });
 /** One planning step: a read call and its result. */
 const readStep = (i: number): Raw[] => [assistant("", call("read", { path: `src/f${i}.ts` })), toolResult()];
+/**
+ * What omp records for `/skill:deep-interview add a flag`, in the shape real session files have (content shortened): a
+ * `custom_message`, attributed to the user, whose content is the expanded skill and whose details name the skill and
+ * what was typed. With nothing typed after the token, `details` has a `prompt` and no `args`.
+ */
+const skillPrompt = (details: Raw = { name: "deep-interview", path: "/home/me/.omp/agent/skills/deep-interview/SKILL.md", args: "add a flag", prompt: "/skill:deep-interview add a flag", lineCount: 3 }, extra: Raw = {}): Raw => ({
+	type: "custom_message",
+	id: "sk1",
+	customType: SKILL_PROMPT_TYPE,
+	content: '[IMPORTANT: User invoked the "deep-interview" skill; follow its instructions. Full skill below.]\n\n# Deep interview\n\nAsk questions.\n\nUser: add a flag',
+	display: true,
+	attribution: "user",
+	details,
+	...extra,
+});
+/** A subagent's autoloaded skill: hidden, agent-attributed, and nothing the user typed. */
+const autoload = (): Raw => ({ type: "custom_message", customType: SKILL_PROMPT_TYPE, content: "# Body\n\nSkill: /x/SKILL.md", display: false, attribution: "agent", details: { name: "dag", path: "/x/SKILL.md" } });
 
 describe("scanBranch", () => {
 	test("carries mode and planFilePath from mode_change entries", () => {
@@ -42,6 +59,77 @@ describe("scanBranch", () => {
 			["write", "local://x-plan.md", "# Plan"],
 			["read", "a.ts", ""],
 		]);
+	});
+});
+
+describe("scanBranch skill-prompt entries", () => {
+	test("reads the skill, what the user typed and the typed prompt from details", () => {
+		const [view] = scanBranch([skillPrompt()]);
+		expect(view.skill).toEqual({ name: "deep-interview", args: "add a flag", prompt: "/skill:deep-interview add a flag", user: true });
+		expect(view.type).toBe("custom_message");
+		expect(view.customType).toBe("skill-prompt");
+	});
+	test("an invocation with nothing typed has no args and keeps the prompt", () => {
+		const [view] = scanBranch([skillPrompt({ name: "dag", path: "/x/SKILL.md", prompt: "/skill:dag", lineCount: 127 })]);
+		expect(view.skill).toEqual({ name: "dag", args: "", prompt: "/skill:dag", user: true });
+	});
+	test("trims what omp recorded, and treats non-string details as nothing typed", () => {
+		const [trimmed, junk] = scanBranch([skillPrompt({ name: "dag", args: "  go  ", prompt: "\n/skill:dag go\n" }), skillPrompt({ name: "dag", args: 7, prompt: { raw: true } })]);
+		expect(trimmed.skill).toMatchObject({ args: "go", prompt: "/skill:dag go" });
+		expect(junk.skill).toMatchObject({ name: "dag", args: "", prompt: "" });
+	});
+	test("a user's invocation is told from a subagent's hidden autoload by attribution, else by display", () => {
+		const views = scanBranch([
+			skillPrompt(),
+			autoload(),
+			skillPrompt({ name: "dag", args: "go" }, { attribution: undefined }),
+			skillPrompt({ name: "dag", args: "go" }, { attribution: undefined, display: undefined }),
+			skillPrompt({ name: "dag", args: "go" }, { attribution: undefined, display: false }),
+			skillPrompt({ name: "dag", args: "go" }, { attribution: "agent" }),
+		]);
+		expect(views.map((v) => v.skill?.user)).toEqual([true, false, true, true, false, false]);
+	});
+	test("is null on every other entry, and on a skill-prompt without a skill name", () => {
+		const views = scanBranch([
+			user("/skill:dag go"),
+			assistant("hi"),
+			{ type: "custom_message", customType: "plan-mode-context", content: "x", details: { name: "dag", args: "go" } },
+			{ type: "custom", customType: "skill-prompt", details: { name: "dag", args: "go" } },
+			{ type: "custom_message", customType: "skill-prompt", details: { args: "no name" } },
+			{ type: "custom_message", customType: "skill-prompt" },
+			modeChange("plan"),
+		]);
+		expect(views.map((v) => v.skill)).toEqual([null, null, null, null, null, null, null]);
+	});
+	test("a skill-prompt entry does not change plan-mode detection", () => {
+		expect(planModeActive(scanBranch([planCtx(), skillPrompt()]))).toBe(true);
+		expect(planModeActive(scanBranch([modeChange("plan"), skillPrompt(), autoload()]))).toBe(true);
+		expect(planModeActive(scanBranch([marker("plan-mode-reference"), skillPrompt()]))).toBe(false);
+		expect(planStartIndex(scanBranch([user("old"), planCtx(), skillPrompt(), assistant("plan")]))).toBe(1);
+	});
+});
+
+describe("scanBranch ask details", () => {
+	const result = (toolName: string, details: unknown, role = "toolResult"): Raw => ({ type: "message", message: { role, toolName, content: [{ type: "text", text: "User selected: Approve" }], details } });
+	const flat = { question: "Approve this spec?", options: ["Request changes", "Approve", "Cancel"], multi: false, selectedOptions: ["Approve"] };
+
+	test("an ask result keeps omp's structured answer, flat or as results[], as recorded", () => {
+		const many = { results: [{ id: "q1", question: "1/2", options: ["a", "b"], multi: false, selectedOptions: ["a"] }] };
+		const [one, several] = scanBranch([result("ask", flat), result("ask", many)]);
+		// The very object omp recorded: nothing is copied per scan.
+		expect(one.message?.details).toBe(flat);
+		expect(several.message?.details).toBe(many);
+	});
+
+	test("no other message carries details: another tool's, an assistant's, a user's", () => {
+		const entries = scanBranch([result("bash", { exitCode: 1 }), result("ask", flat, "assistant"), { type: "message", message: { role: "user", content: [{ type: "text", text: "x" }], details: flat } }]);
+		expect(entries.map((e) => e.message?.details)).toEqual([undefined, undefined, undefined]);
+	});
+
+	test("an ask result without details has none, and the text is still read", () => {
+		const [entry] = scanBranch([result("ask", undefined)]);
+		expect(entry.message?.details).toBeUndefined();
+		expect(entry.message?.text).toBe("User selected: Approve");
 	});
 });
 
@@ -332,6 +420,96 @@ describe("transcript helpers", () => {
 		expect(lastUserText(entries)).toBe("first request");
 		expect(lastUserText(entries, 5)).toBe("first");
 		expect(lastUserText(scanBranch([assistant("only me")]))).toBe("");
+	});
+	// A `/skill:` invocation is a custom message, not a user message, so it used to be invisible here. Reading it as the user's
+	// turn is opt-in (the last argument, `pipeline.skillAware`); without it these helpers are what they were.
+	describe("a skill invocation is a user turn, when asked", () => {
+		const lastOf = (raw: Raw[], max = 1200, redact = false) => lastUserText(scanBranch(raw), max, redact, true);
+		const deltaOf = (raw: Raw[]) => renderDelta(scanBranch(raw), 6000, false, true);
+		test("lastUserText is what the user typed besides the skill token, never the expanded skill", () => {
+			expect(lastOf([user("earlier request"), skillPrompt(), assistant("Which flag?")])).toBe("add a flag");
+		});
+		test("with nothing typed after the token it is no turn: the task stays the last thing the user said, never the bare token", () => {
+			const bare = skillPrompt({ name: "dag", prompt: "/skill:dag" });
+			expect(lastOf([user("earlier"), bare])).toBe("earlier");
+			expect(lastOf([user("earlier"), assistant("On it."), bare, assistant("Which PRD?")])).toBe("earlier");
+			expect(lastOf([bare])).toBe("");
+			// The transcript has no USER line for it either; the delta is the model's side only.
+			expect(deltaOf([bare, assistant("Which PRD?")])).toBe("ASSISTANT: Which PRD?");
+		});
+		test("a skill with args after an arg-less one is the turn again", () => {
+			const bare = skillPrompt({ name: "archify", prompt: "/skill:archify" });
+			expect(lastOf([user("earlier"), bare, skillPrompt({ name: "dag", args: "run it", prompt: "/skill:dag run it" })])).toBe("run it");
+		});
+		test("the latest user turn wins, whichever kind it is", () => {
+			expect(lastOf([skillPrompt(), assistant("Which?"), user("the --verbose one")])).toBe("the --verbose one");
+			expect(lastOf([user("old"), skillPrompt(), assistant("Which?"), skillPrompt({ name: "dag", args: "run it", prompt: "/skill:dag run it" })])).toBe("run it");
+		});
+		test("a subagent's autoload, a skill with no text and a skill-prompt that is not a custom message are skipped", () => {
+			const noText = skillPrompt({ name: "dag", args: " ", prompt: " " });
+			const wrongType = { type: "custom", customType: "skill-prompt", details: { name: "dag", args: "go" } };
+			expect(lastOf([user("real task"), autoload(), noText, wrongType])).toBe("real task");
+			expect(lastOf([autoload()])).toBe("");
+		});
+		test("the cap and the redaction apply to a skill's args as to a message", () => {
+			const token = "ghp_" + "a".repeat(36);
+			const raw = [skillPrompt({ name: "dag", args: `deploy with ${token}`, prompt: `/skill:dag deploy with ${token}` })];
+			expect(lastOf(raw, 6)).toBe("deploy");
+			expect(lastOf(raw, 1200, true)).not.toContain(token);
+			expect(lastOf(raw, 1200, false)).toContain(token);
+		});
+		test("userTurnText is the text of a user message or of a user's skill invocation, and empty for anything else", () => {
+			const [message, skill, hidden, assistantEntry, blank, blankSkill, mode] = scanBranch([
+				user("hello"),
+				skillPrompt(),
+				autoload(),
+				assistant("hi"),
+				user("  \n"),
+				skillPrompt({ name: "dag" }),
+				modeChange("plan"),
+			]);
+			expect([message, skill, hidden, assistantEntry, blank, blankSkill, mode].map((e) => userTurnText(e, true))).toEqual(["hello", "add a flag", "", "", "", "", ""]);
+		});
+		test("renderDelta shows the invocation as a USER line, not the expanded skill", () => {
+			const out = deltaOf([skillPrompt(), autoload(), assistant("Which flag?")]);
+			expect(out.split("\n")).toEqual(["USER: add a flag", "ASSISTANT: Which flag?"]);
+			expect(out).not.toContain("IMPORTANT");
+		});
+		test("what lastUserText and renderDelta do for plain user messages is the same either way", () => {
+			const plain = scanBranch([user("one"), assistant("two"), user("three")]);
+			for (const skills of [false, true]) {
+				expect(lastUserText(plain, 1200, false, skills)).toBe("three");
+				expect(renderDelta(plain, 6000, false, skills).split("\n")).toEqual(["USER: one", "ASSISTANT: two", "USER: three"]);
+			}
+		});
+	});
+	// Not asked (pipeline.skillAware off, and the default of every helper): a skill invocation is no user turn, as before the
+	// pipeline features, whatever its entry holds.
+	describe("a skill invocation is no user turn unless asked", () => {
+		const branch = scanBranch([user("earlier request"), skillPrompt({ name: "dag", args: "run it", prompt: "/skill:dag run it" }), assistant("Which PRD?"), autoload()]);
+		test("userTurnText is empty for every skill entry, a user's included, and the same as always for a message", () => {
+			const [message, skill, , hidden] = branch;
+			for (const skills of [undefined, false]) {
+				expect([message, skill, hidden].map((e) => userTurnText(e, skills))).toEqual(["earlier request", "", ""]);
+			}
+		});
+		test("lastUserText is the last user message, whatever skill ran after it", () => {
+			expect(lastUserText(branch)).toBe("earlier request");
+			expect(lastUserText(branch, 1200, false, false)).toBe("earlier request");
+			expect(lastUserText(scanBranch([skillPrompt()]))).toBe("");
+		});
+		test("renderDelta has no USER line for a skill invocation, and no word of it", () => {
+			for (const out of [renderDelta(branch), renderDelta(branch, 6000, false, false)]) {
+				expect(out.split("\n")).toEqual(["USER: earlier request", "ASSISTANT: Which PRD?"]);
+			}
+		});
+		test("a message with no text, and one that only has whitespace, is no turn in either mode", () => {
+			const blank = scanBranch([user("  \n"), assistant("hi")]);
+			for (const skills of [false, true]) {
+				expect(lastUserText(blank, 1200, false, skills)).toBe("");
+				expect(renderDelta(blank, 6000, false, skills)).toBe("ASSISTANT: hi");
+			}
+		});
 	});
 	test("claimedIntent is the latest non-empty assistant message, capped", () => {
 		expect(claimedIntent(entries)).toBe("All done.");
