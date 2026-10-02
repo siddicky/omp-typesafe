@@ -43,8 +43,8 @@ omp plugin link "$PWD"
 pulls in the omp host package and the TypeScript tooling that [Development](#development) needs for type checking:
 about 1 GB the extension never loads.
 
-Newly added extension modules need a full omp restart (`/reload-plugins` is not enough). There is no npm or
-GitHub Packages release; the plugin is installed straight from the repository.
+Newly added extension modules need a full omp restart (`/reload-plugins` is not enough). Releases are also published
+to npm as [`omp-typesafe`](https://www.npmjs.com/package/omp-typesafe) (see [Development](#development)).
 
 ## What it watches
 
@@ -681,6 +681,12 @@ bun run typecheck     # tsc --noEmit over src/, test/ and bench/ (strict, bundle
 CI (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile`, `bun run typecheck` and `bun test` on every
 push to `main` and on every pull request. The tests need Bun 1.3 or newer and `git` 2.32 or newer, and never reach the network or
 need the omp and Claude CLIs: the TypeSafe client, `omp` and `claude` are all faked.
+
+To release, bump `version` in `package.json` and publish a GitHub release tagged `v<version>`.
+`.github/workflows/npm-publish-github-packages.yml` runs the same checks, then publishes to npm through npm
+trusted publishing (OIDC), so no npm token is stored. A version with a prerelease suffix goes to the `next` dist-tag
+instead of `latest`. The run stops if the tag does not match the version or the version is already on npm. The
+trusted publisher on npmjs.com names that file, so the file keeps its old name.
 
 omp's host package is not a runtime dependency, so `src/host.ts` declares the slice of the extension API the
 plugin uses as local types. `test/host-compat.ts` (type-level only, picked up by `bun run typecheck`) checks those
