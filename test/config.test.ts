@@ -528,6 +528,95 @@ describe("defaultConfig", () => {
 	});
 });
 
+describe("mergeConfig — compaction", () => {
+	test("clamps numbers to their ranges", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			compaction: {
+				keepThreshold: 1.5,
+				minChars: -3,
+				preserveRecent: 5000,
+				rewriteGrowth: 99,
+				minRequestsBetweenRewrites: 20_000,
+				maxRequestsBetweenRewrites: 0,
+				cacheCeiling: 2,
+				timeoutMs: 1,
+			},
+		});
+		expect(cfg.compaction.keepThreshold).toBe(1);
+		expect(cfg.compaction.minChars).toBe(0);
+		expect(cfg.compaction.preserveRecent).toBe(1000);
+		expect(cfg.compaction.rewriteGrowth).toBe(10);
+		expect(cfg.compaction.minRequestsBetweenRewrites).toBe(10_000);
+		expect(cfg.compaction.maxRequestsBetweenRewrites).toBe(1);
+		expect(cfg.compaction.cacheCeiling).toBe(1);
+		expect(cfg.compaction.timeoutMs).toBe(250);
+	});
+
+	test("clamps at the lower bounds too", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			compaction: {
+				keepThreshold: -1,
+				rewriteGrowth: -0.5,
+				minRequestsBetweenRewrites: -7,
+				cacheCeiling: -2,
+				timeoutMs: 120_000,
+			},
+		});
+		expect(cfg.compaction.keepThreshold).toBe(0);
+		expect(cfg.compaction.rewriteGrowth).toBe(0);
+		expect(cfg.compaction.minRequestsBetweenRewrites).toBe(0);
+		expect(cfg.compaction.cacheCeiling).toBe(0);
+		expect(cfg.compaction.timeoutMs).toBe(60_000);
+	});
+
+	test("truncates fractional counts", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			compaction: { minChars: 12345.7, preserveRecent: 2.9, minRequestsBetweenRewrites: 3.5, maxRequestsBetweenRewrites: 9.9, timeoutMs: 1500.5 },
+		});
+		expect(cfg.compaction.minChars).toBe(12345);
+		expect(cfg.compaction.preserveRecent).toBe(2);
+		expect(cfg.compaction.minRequestsBetweenRewrites).toBe(3);
+		expect(cfg.compaction.maxRequestsBetweenRewrites).toBe(9);
+		expect(cfg.compaction.timeoutMs).toBe(1500);
+	});
+
+	test("non-number and non-boolean values fall back to the base", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, {
+			compaction: {
+				enabled: "yes",
+				keepThreshold: "high",
+				minChars: null,
+				spill: 1,
+				preserveRecent: "many",
+				sticky: "on",
+				rewriteGrowth: NaN,
+				minRequestsBetweenRewrites: [],
+				maxRequestsBetweenRewrites: false,
+				cacheCeiling: Infinity,
+				timeoutMs: {},
+			},
+		});
+		expect(cfg.compaction).toEqual(DEFAULT_CONFIG.compaction);
+	});
+
+	test("valid values pass through", () => {
+		const override = {
+			enabled: false,
+			keepThreshold: 0.7,
+			minChars: 42_000,
+			spill: false,
+			preserveRecent: 12,
+			sticky: false,
+			rewriteGrowth: 0.9,
+			minRequestsBetweenRewrites: 4,
+			maxRequestsBetweenRewrites: 25,
+			cacheCeiling: 0.5,
+			timeoutMs: 4_000,
+		};
+		expect(mergeConfig(DEFAULT_CONFIG, { compaction: override }).compaction).toEqual(override);
+	});
+});
+
 describe("loadConfig", () => {
 	const saved = {
 		TYPESAFE_CONFIG: process.env.TYPESAFE_CONFIG,
@@ -597,6 +686,7 @@ describe("loadConfig", () => {
 		expect(cfg.adversary.enabled).toBe(false);
 		expect(cfg.ambiguityGate.enabled).toBe(false);
 		expect(cfg.stopGate.enabled).toBe(false);
+		expect(cfg.compaction.enabled).toBe(false);
 		expect(getConfigWarnings()).toHaveLength(1);
 		expect(getConfigWarnings()[0]).toContain("unreadable");
 		expect(warned).toHaveLength(1);

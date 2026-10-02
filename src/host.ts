@@ -182,6 +182,21 @@ export interface SessionStopResult {
 	additionalContext?: string;
 }
 
+/** A message of the conversation. The extension reads it only through src/compaction.ts, which checks every field it uses. */
+export interface HostAgentMessage {
+	role: string;
+}
+
+/** The messages about to go to the model: a copy the handler may modify or replace. */
+export interface ContextEvent extends HostEventBase {
+	messages?: HostAgentMessage[];
+}
+
+/** Replaces the messages of this one request; the session itself is untouched. Every message returned was received. */
+export interface ContextResult {
+	messages?: HostAgentMessage[];
+}
+
 type Maybe<T> = T | undefined | void;
 
 /** Event name -> its payload and what a handler may return (nothing, unless listed). */
@@ -200,6 +215,7 @@ export interface HostEvents {
 	tool_call: { event: ToolCallEvent; result: Maybe<ToolCallResult> };
 	tool_result: { event: ToolResultEvent; result: Maybe<ToolResultPatch> };
 	session_stop: { event: SessionStopEvent; result: Maybe<SessionStopResult> };
+	context: { event: ContextEvent; result: Maybe<ContextResult> };
 }
 
 // ---- tools and commands -----------------------------------------------------------------------------

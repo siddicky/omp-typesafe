@@ -79,6 +79,39 @@ export interface PipelineSettings {
 	approvalGuard: boolean;
 }
 
+/**
+ * Verbatim context reduction (src/compaction.ts). Before a model request whose context is at least `minChars`, Jev scores
+ * every tool call and result in the history; the outputs it judges no longer needed are cut to a short head and a note
+ * naming the file that holds the rest. Only what that request sends changes: the session on disk is untouched. What goes
+ * to TypeSafe is the conversation (tool names, inputs, message text), masked when `adversary.redact` is on.
+ */
+export interface CompactionSettings {
+	enabled: boolean;
+	/** Minimum probability Jev must give a tool result for it to stay in full. */
+	keepThreshold: number;
+	/** A context shorter than this many characters is left alone. */
+	minChars: number;
+	/** Write each cut output to <agent dir>/jev-spill so the agent can read it back. Off, a cut output is gone for that request. */
+	spill: boolean;
+	/** The newest this many messages are never touched. */
+	preserveRecent: number;
+	/**
+	 * Re-score rarely and re-apply the same decisions in between, so the provider's prompt cache keeps hitting. Off, every
+	 * request is re-scored, except a session already served mostly from cache (`cacheCeiling`).
+	 */
+	sticky: boolean;
+	/** Sticky: re-score once the context has grown by this share since the last rewrite. */
+	rewriteGrowth: number;
+	/** Sticky: never re-score more often than this many requests apart, whatever the growth. */
+	minRequestsBetweenRewrites: number;
+	/** Sticky: re-score at least this often, in requests. */
+	maxRequestsBetweenRewrites: number;
+	/** Not sticky: skip a session whose last request was at least this share cache reads. */
+	cacheCeiling: number;
+	/** Per request to Jev, in ms. */
+	timeoutMs: number;
+}
+
 export type TypesafeRole = "adversarial" | "advisory";
 export type TypesafePhase = "plan" | "execute";
 
@@ -90,6 +123,7 @@ export interface TypesafeConfig {
 	stopGate: StopGateSettings;
 	ambiguityGate: AmbiguityGateSettings;
 	pipeline: PipelineSettings;
+	compaction: CompactionSettings;
 }
 
 export const DEFAULT_CONFIG: TypesafeConfig = {
@@ -127,6 +161,19 @@ export const DEFAULT_CONFIG: TypesafeConfig = {
 		timeoutMs: 2500,
 	},
 	pipeline: { planGuard: true, skillAware: true, skills: [...DEFAULT_PIPELINE_SKILLS], specChecks: true, approvalGuard: false },
+	compaction: {
+		enabled: true,
+		keepThreshold: 0.2,
+		minChars: 150_000,
+		spill: true,
+		preserveRecent: 6,
+		sticky: true,
+		rewriteGrowth: 0.4,
+		minRequestsBetweenRewrites: 15,
+		maxRequestsBetweenRewrites: 40,
+		cacheCeiling: 0.8,
+		timeoutMs: 10_000,
+	},
 };
 
 type Env = Record<string, string | undefined>;
@@ -385,11 +432,13 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 	const gate = (typeof o.stopGate === "object" && o.stopGate !== null ? o.stopGate : {}) as Record<string, unknown>;
 	const amb = (typeof o.ambiguityGate === "object" && o.ambiguityGate !== null ? o.ambiguityGate : {}) as Record<string, unknown>;
 	const pipe = (typeof o.pipeline === "object" && o.pipeline !== null ? o.pipeline : {}) as Record<string, unknown>;
+	const comp = (typeof o.compaction === "object" && o.compaction !== null ? o.compaction : {}) as Record<string, unknown>;
 	const ambWeights = (typeof amb.weights === "object" && amb.weights !== null ? amb.weights : {}) as Record<string, unknown>;
 	const a = base.adversary;
 	const g = base.stopGate;
 	const ag = base.ambiguityGate;
 	const pl = base.pipeline;
+	const cm = base.compaction;
 	const [concernSeverity, blockerSeverity] = orderSeverities(
 		num(adv.concern_severity, a.concern_severity, 0, 3),
 		num(adv.blocker_severity, a.blocker_severity, 0, 3),
@@ -451,13 +500,27 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 			specChecks: bool(pipe.specChecks, pl.specChecks),
 			approvalGuard: bool(pipe.approvalGuard, pl.approvalGuard),
 		},
+		compaction: {
+			enabled: bool(comp.enabled, cm.enabled),
+			keepThreshold: num(comp.keepThreshold, cm.keepThreshold, 0, 1),
+			minChars: Math.trunc(num(comp.minChars, cm.minChars, 0, 100_000_000)),
+			spill: bool(comp.spill, cm.spill),
+			preserveRecent: Math.trunc(num(comp.preserveRecent, cm.preserveRecent, 0, 1000)),
+			sticky: bool(comp.sticky, cm.sticky),
+			rewriteGrowth: num(comp.rewriteGrowth, cm.rewriteGrowth, 0, 10),
+			minRequestsBetweenRewrites: Math.trunc(num(comp.minRequestsBetweenRewrites, cm.minRequestsBetweenRewrites, 0, 10_000)),
+			maxRequestsBetweenRewrites: Math.trunc(num(comp.maxRequestsBetweenRewrites, cm.maxRequestsBetweenRewrites, 1, 10_000)),
+			cacheCeiling: num(comp.cacheCeiling, cm.cacheCeiling, 0, 1),
+			timeoutMs: Math.trunc(num(comp.timeoutMs, cm.timeoutMs, 250, 60_000)),
+		},
 	};
 }
 
 /**
  * Config used when the file exists but cannot be read or parsed. Defaults would silently re-enable the
- * paid reviewers for a user who had turned them off, so they stay off until the file is fixed
- * (TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE can still turn them on).
+ * paid reviewers, and context compaction (which also sends the conversation to TypeSafe), for a user who had turned
+ * them off, so they stay off until the file is fixed
+ * (TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE can still turn the reviewers on).
  */
 function failClosed(base: TypesafeConfig): TypesafeConfig {
 	return {
@@ -465,6 +528,7 @@ function failClosed(base: TypesafeConfig): TypesafeConfig {
 		adversary: { ...base.adversary, enabled: false },
 		stopGate: { ...base.stopGate, enabled: false },
 		ambiguityGate: { ...base.ambiguityGate, enabled: false },
+		compaction: { ...base.compaction, enabled: false },
 	};
 }
 

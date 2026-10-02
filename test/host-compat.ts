@@ -6,6 +6,7 @@
  */
 import type {
 	BeforeAgentStartEventResult,
+	ContextEventResult,
 	ExtensionAPI as RealAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -16,6 +17,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 import type {
 	BeforeAgentStartResult,
+	ContextResult,
 	ExtensionAPI,
 	HostCommand,
 	HostContext,
@@ -248,6 +250,16 @@ export const everyEventIsChecked: { [K in keyof HostEvents]: () => void } = {
 		real.on("session_stop", (event, ctx) => {
 			type Fits = Assert<EventFits<HostEvents["session_stop"]["event"], typeof event>>;
 			return handler<"session_stop">()(event, ctx);
+		});
+	},
+	context: () => {
+		real.on("context", (event) => {
+			type Fits = Assert<EventFits<HostEvents["context"]["event"], typeof event>>;
+			// The handler returns messages it received. The host's AgentMessage is a wide union that the local
+			// HostAgentMessage deliberately does not mirror, so the result is checked by field name and by what the host
+			// sends us (a host message must fit the local one), not by assigning the local result to the host's.
+			type ResultKeys = Assert<HasKeys<ContextResult, ContextEventResult>>;
+			type ResultFits = Assert<ReadFits<ContextResult, ContextEventResult>>;
 		});
 	},
 };

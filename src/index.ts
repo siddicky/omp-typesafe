@@ -16,6 +16,8 @@ import {
 	setClientLogger,
 } from "./client";
 import type { WireAnswer } from "./client";
+import { createCompactor } from "./compaction";
+import type { ContextReducer } from "./compaction";
 import { agentDir, getConfig, getConfigWarnings, loadConfig, subagentGuardEnabled } from "./config";
 import type { TypesafeRole } from "./config";
 import type { ExtensionAPI, HostContentBlock, HostContext, HostEvents, HostLogger, HostMessage, NotifyLevel, ToolCallResult, ZodSchema } from "./host";
@@ -108,6 +110,8 @@ let planGuardBlocks = 0;
 let approvalBlocks = 0;
 let approvalWouldBlocks = 0;
 let specNotesSent = 0;
+/** Verbatim context reduction for this session (src/compaction.ts); built on the first `context` event, dropped with the session. */
+let compactor: ContextReducer | undefined;
 /** One key per spec file content that already got its note (see checkSpecWrite). */
 const specNoteKeys = new Set<string>();
 
@@ -531,6 +535,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		approvalWouldBlocks = 0;
 		specNotesSent = 0;
 		specNoteKeys.clear();
+		compactor = undefined;
 		resetAmbiguitySession();
 		planStart = -1;
 		planStartId = null;
@@ -578,6 +583,19 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	on("session_branch", resetCursorAndPlan);
 	on("session_tree", resetCursorAndPlan);
 	on("session_compact", resetCursor);
+
+	// Replaces the messages of this one request, never the session. Off without a key: nothing to score with, and no cost.
+	on("context", async (event) => {
+		const cfg = getConfig().compaction;
+		if (!cfg.enabled || !event.messages || !apiKeyPresent()) return;
+		try {
+			compactor ??= createCompactor(cfg, { redact: redactOn(), log: (message) => logger?.info?.(message) });
+			const messages = await compactor(event.messages);
+			return messages ? { messages } : undefined;
+		} catch (err) {
+			logger?.warn?.(`[typesafe] context compaction failed: ${describeError(err)}`);
+		}
+	});
 
 	/** One user prompt: reset the per-prompt budgets and the command log, and pin the HEAD to diff against. */
 	on("agent_start", async (_event, ctx) => {
