@@ -103,10 +103,17 @@ function scanToolCall(block: Record<string, unknown>): ToolCallView {
 	return {
 		name,
 		input,
-		inputPreview: firstLine(stringifyInput(input, PREVIEW_MAX * MASK_HEADROOM), PREVIEW_MAX * MASK_HEADROOM),
+		// Metadata scans do not need to format every historical tool payload.
+		get inputPreview() {
+			return firstLine(stringifyInput(input, PREVIEW_MAX * MASK_HEADROOM), PREVIEW_MAX * MASK_HEADROOM);
+		},
 		path,
-		content: typeof written === "string" ? cap(written, WRITE_CONTENT_CAP) : "",
-		editText: name === "edit" ? (patch !== null && editPaths.length > 0 ? cap(patch, EDIT_TEXT_CAP) : stringifyInput(input, EDIT_TEXT_CAP)) : "",
+		get content() {
+			return typeof written === "string" ? cap(written, WRITE_CONTENT_CAP) : "";
+		},
+		get editText() {
+			return name === "edit" ? (patch !== null && editPaths.length > 0 ? cap(patch, EDIT_TEXT_CAP) : stringifyInput(input, EDIT_TEXT_CAP)) : "";
+		},
 		editPaths,
 	};
 }
@@ -344,12 +351,13 @@ export function planSoFar(entries: EntryView[], max = 6000, from = planStartInde
 		if (m.text.trim().length > 0) lines.push(`ASSISTANT: ${m.text}`);
 		m.toolCalls.forEach((tc, j) => {
 			const latest = tc.path === null ? undefined : latestWrite.get(tc.path.trim());
+			const editText = tc.editText;
 			if (latest === `${i}:${j}`) lines.push(`  write ${tc.path}:\n${tc.content}`);
 			else if (latest !== undefined && tc.content.length > 0) lines.push(`  call write: ${tc.path} (superseded by a later write)`);
 			// A revision made with `edit` is part of the plan too: show more of it than the one-line preview does. A hashline
 			// edit has no `path` field; the file it names is in the patch text.
-			else if (tc.editText.length > 0 && isPlanFilePath(tc.path, known)) lines.push(`  edit ${tc.path}: ${tc.editText}`);
-			else if (tc.editText.length > 0 && tc.editPaths.some((p) => isPlanFilePath(p, known))) lines.push(`  edit ${tc.editPaths.find((p) => isPlanFilePath(p, known))}: ${tc.editText}`);
+			else if (editText.length > 0 && isPlanFilePath(tc.path, known)) lines.push(`  edit ${tc.path}: ${editText}`);
+			else if (editText.length > 0 && tc.editPaths.some((p) => isPlanFilePath(p, known))) lines.push(`  edit ${tc.editPaths.find((p) => isPlanFilePath(p, known))}: ${editText}`);
 			else lines.push(`  call ${tc.name}: ${previewOf(tc, redact)}`);
 		});
 	}
