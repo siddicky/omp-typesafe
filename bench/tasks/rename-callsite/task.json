@@ -17,7 +17,15 @@
     "registry|dynamic|string key|lookup",
     "test|bun test"
   ],
+  "checklistQuestions": [
+    "The `plan` identifies src/consumer.ts as a caller of fetchUser that must be updated.",
+    "The `plan` recognizes that src/consumer.ts reaches fetchUser through the src/index.ts barrel re-export instead of importing it directly from src/user.ts.",
+    "The `plan` recognizes that the registry dispatch table and the runtime string-key lookup (src/registry.ts, src/dynamicConsumer.ts) must be renamed too, even though no direct `fetchUser(` call appears there.",
+    "The `plan` includes running the test suite to verify the rename."
+  ],
   "forbiddenFiles": [],
   "requiredGrep": ["loadUser"],
-  "forbiddenGrep": ["fetchUser"]
+  "forbiddenGrep": ["fetchUser"],
+  "protectedPaths": ["test/"],
+  "gradingNotes": "Execution grading (grade.ts) greps source files for `forbiddenGrep`/`requiredGrep` with comments ignored, so the seed's explanatory comments that mention fetchUser do not fail a correct rename; the runtime string key in src/dynamicConsumer.ts is code and is still caught. Untracked files count (a compat shim that still exports fetchUser fails). Seed tests are protected (`protected_files_intact`)."
 }

@@ -1,10 +1,11 @@
+import type { EntryType, Questions } from "@typesafe-ai/sdk";
 import { apiKeyPresent, ask, describeError, choice, noul, score } from "./client";
 import type { WireAnswer } from "./client";
 import { getConfig } from "./config";
 import type { TypesafeRole } from "./config";
 import { planModeActive, scanBranch } from "./branch";
 import type { EntryView } from "./branch";
-import { cap, escapeAttr, fmt2 } from "./text";
+import { cap, EDIT_TOOLS, escapeAttr, fmt2, inputPaths, isRecord } from "./text";
 import { formatEvidenceAttribute } from "./evidence";
 import type { Evidence } from "./evidence";
 
@@ -196,13 +197,24 @@ const SEVERITY_INSTRUCTION: Record<ReviewKind, string> = {
 	turn: "Rate the most serious defect present in this turn's delta.",
 };
 
-const CONTENT_FREE_NOTES = new Set(["stop", "done", "complete", "no issue", "no issues continue", "lgtm", "nothing to add"]);
+// Failed actions (non-zero exit) are judged on what they already did, never on the failure itself.
+const FAILED_ACTION_NOUL_IDS = ACTION_NOUL_IDS.filter((id) => id !== "unverified_claim");
+const FAILED_ACTION_SEVERITY_INSTRUCTION =
+	"This action failed (see exit_status). Do not rate the failure itself. Rate the most serious damage it already did before failing, such as discarded work, a half-applied migration, or a broken caller.";
+// A failed adversarial action may only raise a concern or blocker for damage that already happened.
+const SIDE_EFFECT_NOUL_IDS = new Set(["hidden_destruction", "incomplete_cutover", "breaks_contract"]);
+
 const NOTE_HISTORY_CAP = 256;
-const RING_BUFFER_CAP = 50;
-const MAX_MESSAGE_REVIEWS_PER_TURN = 3;
+/** Dedupe entries stop suppressing after this many model turns, or when a new user prompt begins. */
+export const NOTE_DEDUPE_TTL_TURNS = 6;
+/** Telemetry history bound (bench log, /adversary dump); older records are dropped and counted. */
+export const HISTORY_CAP = 2000;
+/** Per-prompt (agent_start to agent_end) budgets, separate from the per-model-call turn fan-out cap. */
+export const MAX_CALLS_PER_PROMPT = 64;
+export const MAX_MESSAGE_REVIEWS_PER_PROMPT = 12;
 
 export interface UiLike {
-	notify(message: string, level?: string): unknown;
+	notify(message: string, level?: "info" | "warning" | "error"): unknown;
 }
 
 export interface CtxLike {
@@ -215,20 +227,23 @@ export interface CtxLike {
 export interface PiLike {
 	sendMessage(message: unknown, options?: unknown): unknown;
 	logger?: {
-		debug?: (...a: unknown[]) => void;
-		info?: (...a: unknown[]) => void;
-		warn?: (...a: unknown[]) => void;
-		error?: (...a: unknown[]) => void;
+		debug?: (message: string) => void;
+		info?: (message: string) => void;
+		warn?: (message: string) => void;
+		error?: (message: string) => void;
 	};
 }
 
 export interface ReviewOutcome {
 	severity: Severity | "none";
 	note?: string;
+	/** `delivered_inline`: the caller asked for inline delivery (`ReviewOpts.inline`) and must attach `note` itself. */
 	decision: "delivered" | "delivered_inline" | "suppressed" | "none" | "error";
 	channel?: "aside" | "steer" | "nextTurn";
 	reason?: string;
 }
+
+export type DowngradeReason = "immune" | "low_confidence" | "plan_mode";
 
 export interface ReviewRecord {
 	ts: string;
@@ -237,8 +252,13 @@ export interface ReviewRecord {
 	toolCallId?: string;
 	severity: Severity | "none";
 	decision: ReviewOutcome["decision"];
+	/** Delivery channel; `inline` when the note rode on the tool result instead of a message. */
 	channel?: string;
 	reason?: string;
+	/** Why a would-be steer went out quietly (immunity window, plan mode, or a low-confidence severity). */
+	downgrade?: DowngradeReason;
+	/** The reviewed action had failed (state.exit_status === "error"). */
+	failed?: boolean;
 	fired?: string[];
 	defect?: string;
 	scores?: Record<string, number>;
@@ -250,22 +270,41 @@ export interface ReviewRecord {
 
 // ---- per-session mutable state -------------------------------------------------
 
-const ringBuffer: ReviewRecord[] = [];
-const noteHistory: { key: string; sev: number }[] = [];
+interface NoteEntry {
+	key: string;
+	/** Strength of what was actually delivered (a SEVERITY_ORDER value). */
+	sev: number;
+	/** True when a would-be steer went out quietly, so one later steer is still allowed. */
+	downgraded: boolean;
+	prompt: number;
+	turn: number;
+}
+
+const history: ReviewRecord[] = [];
+const noteHistory: NoteEntry[] = [];
 const stats = {
 	delivered: { nit: 0, concern: 0, blocker: 0 },
 	suppressed: {} as Record<string, number>,
 	downgraded: 0,
 	errors: 0,
 	steers: 0,
+	/** Telemetry records evicted from the bounded history (the bench log is incomplete when this is non-zero). */
+	historyDropped: 0,
 };
+let promptSeq = 0;
+let turnSeq = 0;
 let callsThisTurn = 0;
-let messageReviewsThisTurn = 0;
-let immuneRemaining = 0;
+let callsThisPrompt = 0;
+let notesThisTurn = 0;
+let messageReviewsThisPrompt = 0;
+// Turns are omp turns (one model call plus its tool executions), counted by beginTurn(). A steer at turn S
+// keeps immunity through turn S + immuneTurns, so a steer issued from turn_end still protects the next
+// immuneTurns turns instead of being decremented by that same turn_end.
+let immuneUntilTurn: number | null = null;
 let unavailableNotified = false;
 
 export function resetReviewerSession(): void {
-	ringBuffer.length = 0;
+	history.length = 0;
 	noteHistory.length = 0;
 	stats.delivered.nit = 0;
 	stats.delivered.concern = 0;
@@ -274,66 +313,102 @@ export function resetReviewerSession(): void {
 	stats.downgraded = 0;
 	stats.errors = 0;
 	stats.steers = 0;
+	stats.historyDropped = 0;
+	promptSeq = 0;
+	turnSeq = 0;
 	callsThisTurn = 0;
-	messageReviewsThisTurn = 0;
-	immuneRemaining = 0;
+	callsThisPrompt = 0;
+	notesThisTurn = 0;
+	messageReviewsThisPrompt = 0;
+	immuneUntilTurn = null;
 	unavailableNotified = false;
 }
 
-/** Consume one unit of the per-turn call budget; false when exhausted. */
-export function consumeCallBudget(): boolean {
-	const max = getConfig().adversary.maxCallsPerTurn;
-	if (callsThisTurn >= max) return false;
+type BudgetVerdict = "ok" | "call_budget" | "prompt_budget";
+
+function takeCall(): BudgetVerdict {
+	if (callsThisTurn >= getConfig().adversary.maxCallsPerTurn) return "call_budget";
+	if (callsThisPrompt >= MAX_CALLS_PER_PROMPT) return "prompt_budget";
 	callsThisTurn += 1;
-	return true;
-}
-
-export function beginTurn(): void {
-	callsThisTurn = 0;
-	messageReviewsThisTurn = 0;
-}
-
-/** Permit another message review this turn? */
-export function canReviewMessage(): boolean {
-	return messageReviewsThisTurn < MAX_MESSAGE_REVIEWS_PER_TURN;
-}
-
-export function recordMessageReviewed(): void {
-	messageReviewsThisTurn += 1;
-}
-
-/** Turn completed: decrement the steer-immunity counter. */
-export function endTurn(): void {
-	if (immuneRemaining > 0) immuneRemaining -= 1;
+	callsThisPrompt += 1;
+	return "ok";
 }
 
 /**
- * Shared emission guard over the note-history ring: true when a note with this
- * semantic key has not been emitted before at an equal or higher severity.
- * Records the key on success, so callers must only call it when about to emit.
- * Used by the reviewer's own dedupe and by the ambiguity gate (key `gate|<dim>`).
+ * Would review() still be allowed a Jev call? Does not consume anything, so a caller can skip
+ * work that only feeds a review (such as collecting git evidence) once the budget is spent.
  */
-export function shouldEmit(key: string, sev: number): boolean {
-	const priorHighest = noteHistory
-		.filter((h) => h.key === key)
-		.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
-	if (priorHighest !== null && priorHighest >= sev) return false;
-	noteHistory.push({ key, sev });
+export function hasCallBudget(): boolean {
+	return callsThisTurn < getConfig().adversary.maxCallsPerTurn && callsThisPrompt < MAX_CALLS_PER_PROMPT;
+}
+
+/**
+ * A new user prompt began (omp `agent_start`): reset the per-prompt budgets and expire reviewer
+ * dedupe entries. An omp "turn" is one model call, so per-prompt limits cannot live in beginTurn().
+ */
+export function beginPrompt(): void {
+	promptSeq += 1;
+	callsThisPrompt = 0;
+	messageReviewsThisPrompt = 0;
+}
+
+/**
+ * A model turn began (omp `turn_start`): reset the per-turn fan-out and note budgets. Pass omp's
+ * `turnIndex` so the first turn of a prompt also starts a new prompt even if agent_start was missed.
+ */
+export function beginTurn(turnIndex?: number): void {
+	if (turnIndex === 0) beginPrompt();
+	turnSeq += 1;
+	callsThisTurn = 0;
+	notesThisTurn = 0;
+}
+
+/** Permit another message review this prompt? */
+export function canReviewMessage(): boolean {
+	return messageReviewsThisPrompt < MAX_MESSAGE_REVIEWS_PER_PROMPT;
+}
+
+export function recordMessageReviewed(): void {
+	messageReviewsThisPrompt += 1;
+}
+
+/** Dedupe entries stop counting when a new prompt starts or after NOTE_DEDUPE_TTL_TURNS model turns. */
+function isLive(entry: NoteEntry): boolean {
+	return entry.prompt === promptSeq && turnSeq - entry.turn <= NOTE_DEDUPE_TTL_TURNS;
+}
+
+function liveEntries(key: string): NoteEntry[] {
+	return noteHistory.filter((h) => h.key === key && isLive(h));
+}
+
+function highestSev(entries: NoteEntry[]): number | null {
+	return entries.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
+}
+
+function pushNote(entry: Omit<NoteEntry, "prompt" | "turn">): void {
+	noteHistory.push({ ...entry, prompt: promptSeq, turn: turnSeq });
 	if (noteHistory.length > NOTE_HISTORY_CAP) noteHistory.shift();
-	return true;
+}
+
+/** Turn completed: drop expired dedupe entries. (Steer immunity is turn-indexed and needs no decrement.) */
+export function endTurn(): void {
+	for (let i = noteHistory.length - 1; i >= 0; i--) {
+		if (!isLive(noteHistory[i])) noteHistory.splice(i, 1);
+	}
 }
 
 /** True while a recent steer's immunity window is still open. */
 export function isSteerImmune(): boolean {
-	return immuneRemaining > 0;
+	return immuneUntilTurn !== null && turnSeq <= immuneUntilTurn;
 }
 
+/** Every recorded review, oldest first, bounded by HISTORY_CAP; stats.historyDropped counts evictions. */
 export function getReviewHistory(): ReviewRecord[] {
-	return [...ringBuffer];
+	return [...history];
 }
 
 export function getLastReviewRecord(): ReviewRecord | null {
-	return ringBuffer.length > 0 ? ringBuffer[ringBuffer.length - 1] : null;
+	return history.length > 0 ? history[history.length - 1] : null;
 }
 
 export function getReviewStats(): typeof stats {
@@ -343,13 +418,14 @@ export function getReviewStats(): typeof stats {
 		downgraded: stats.downgraded,
 		errors: stats.errors,
 		steers: stats.steers,
+		historyDropped: stats.historyDropped,
 	};
 }
 
 // ---- batteries -----------------------------------------------------------------
 
-function noulQuestions(ids: string[]) {
-	const questions: Record<string, unknown> = {};
+function noulQuestions(ids: string[]): Questions {
+	const questions: Questions = {};
 	for (const id of ids) {
 		const def = SHARED_NOULS[id];
 		questions[id] = noul(def.instructions, { true: def.whenTrue, false: def.whenFalse });
@@ -358,7 +434,7 @@ function noulQuestions(ids: string[]) {
 }
 
 export interface Battery {
-	questions: Record<string, unknown>;
+	questions: Questions;
 	/** All noul ids in the battery, including on_track for advisory (used to build the state). */
 	noulIds: string[];
 	/** noulIds minus on_track — the ids that participate in severity/fired escalation. */
@@ -368,34 +444,38 @@ export interface Battery {
 	severityLevels: readonly string[];
 }
 
+export interface BatteryOpts {
+	/** The reviewed action failed (state.exit_status === "error"); only applies to kind "action". */
+	failed?: boolean;
+}
+
 /** Build the full question battery for a review kind and role. */
-export function buildBattery(kind: ReviewKind, role: TypesafeRole = "adversarial"): Battery {
+export function buildBattery(kind: ReviewKind, role: TypesafeRole = "adversarial", opts: BatteryOpts = {}): Battery {
+	const failed = kind === "action" && opts.failed === true;
+	const severityInstruction = failed ? FAILED_ACTION_SEVERITY_INSTRUCTION : SEVERITY_INSTRUCTION[kind];
 	if (role === "advisory") {
 		const noulIds =
 			kind === "action" ? ADVISORY_ACTION_NOUL_IDS : kind === "message" ? ADVISORY_MESSAGE_NOUL_IDS : ADVISORY_TURN_NOUL_IDS;
 		const escalationNoulIds = noulIds.filter((id) => id !== "on_track");
-		const questions = {
+		const questions: Questions = {
 			...noulQuestions(noulIds),
-			severity: score(SEVERITY_INSTRUCTION[kind], [...ADVISORY_SEVERITY_LEVELS]),
+			severity: score(severityInstruction, ADVISORY_SEVERITY_LEVELS),
 			theme: choice("Which best describes what's worth raising, if anything?", ADVISORY_THEMES),
 		};
 		return { questions, noulIds, escalationNoulIds, defectKey: "theme", severityLevels: ADVISORY_SEVERITY_LEVELS };
 	}
-	const noulIds = kind === "action" ? ACTION_NOUL_IDS : kind === "message" ? MESSAGE_NOUL_IDS : TURN_NOUL_IDS;
+	const noulIds =
+		kind === "action" ? (failed ? FAILED_ACTION_NOUL_IDS : ACTION_NOUL_IDS) : kind === "message" ? MESSAGE_NOUL_IDS : TURN_NOUL_IDS;
 	const defectCriteria = kind === "action" ? ACTION_DEFECTS : EXTENDED_DEFECTS;
-	const questions = {
+	const questions: Questions = {
 		...noulQuestions(noulIds),
-		severity: score(SEVERITY_INSTRUCTION[kind], [...SEVERITY_LEVELS]),
+		severity: score(severityInstruction, SEVERITY_LEVELS),
 		defect_class: choice("Which best describes the defect, if any?", defectCriteria),
 	};
 	return { questions, noulIds, escalationNoulIds: noulIds, defectKey: "defect_class", severityLevels: SEVERITY_LEVELS };
 }
 
 // ---- severity + guard ----------------------------------------------------------
-
-function normalizeNote(text: string): string {
-	return text.toLowerCase().normalize("NFKC").replace(/[^a-z0-9]+/g, " ").trim();
-}
 
 function numField(answer: WireAnswer | undefined, key: string): number | null {
 	if (!answer) return null;
@@ -410,8 +490,11 @@ export function extractNoul(answer: WireAnswer | undefined): number | null {
 
 function record(pi: PiLike, kind: ReviewKind, entry: Omit<ReviewRecord, "ts" | "kind" | "usage">, usage: { inputTokens: number; outputTokens: number }): ReviewRecord {
 	const full: ReviewRecord = { ts: new Date().toISOString(), kind, usage, ...entry };
-	ringBuffer.push(full);
-	if (ringBuffer.length > RING_BUFFER_CAP) ringBuffer.shift();
+	history.push(full);
+	if (history.length > HISTORY_CAP) {
+		history.shift();
+		stats.historyDropped += 1;
+	}
 	pi.logger?.debug?.(`[typesafe] review kind=${kind} decision=${full.decision} severity=${full.severity}${full.reason ? ` reason=${full.reason}` : ""}${full.channel ? ` channel=${full.channel}` : ""}${full.toolCallId ? ` tool=${full.toolCallId}` : ""}`);
 	return full;
 }
@@ -449,86 +532,193 @@ function buildAdvisoryNote(kind: ReviewKind, severity: Severity, theme: string, 
 	const top = fired.reduce<{ id: string; value: number } | null>((acc, f) => (acc === null || f.value > acc.value ? f : acc), null);
 	const topDef = top ? SHARED_NOULS[top.id] : undefined;
 	const claim = topDef
-		? `${topDef.whenTrue} (${top!.id}).`
+		? `${topDef.whenTrue.replace(/[.!]$/, "")} (${top!.id}).`
 		: `TypeSafe advisory review of the last ${KIND_NOUN[kind]} raises ${theme}${firedNames ? ` (${firedNames})` : ""}.`;
 	return `<advisory ${attrs.join(" ")}>\n${claim} Consider this before continuing.\n</advisory>`;
 }
 
-function routeDelivery(kind: ReviewKind, severity: Severity, entries: EntryView[], ctx: CtxLike): { channel: "aside" | "steer" | "nextTurn"; triggerTurn: boolean; immuneDowngrade: boolean } {
-	let channel: "aside" | "steer" | "nextTurn";
+/**
+ * Delivery routing. omp's `aside` injects at the next step boundary, but when the session is idle it starts
+ * a turn (asides still queued when a run settles are flushed as a wake turn). So an aside is only used where
+ * a model step is guaranteed to follow, a tool result; after a message or turn the run may already be over,
+ * and quiet notes there use `nextTurn`, which stays hidden until the next prompt consumes it.
+ */
+interface Route {
+	channel: "aside" | "steer" | "nextTurn";
+	triggerTurn: boolean;
+	/** Set when a note that would have steered went out quietly instead. */
+	downgrade: DowngradeReason | null;
+}
+
+function routeDelivery(kind: ReviewKind, severity: Severity, entries: EntryView[], ctx: CtxLike, lowConfidence: boolean): Route {
+	const quiet = kind === "action" ? "aside" : "nextTurn";
+	let channel: Route["channel"];
 	let triggerTurn = false;
-	if (severity === "nit") {
-		channel = "aside";
-	} else if (severity === "blocker") {
+	if (severity === "blocker") {
 		channel = "steer";
 		triggerTurn = true;
-	} else {
+	} else if (severity === "concern" && kind !== "action") {
+		// Mid tool batch only a blocker may steer; after a message or turn a concern steers unless idle.
 		channel = ctx.isIdle?.() === true ? "nextTurn" : "steer";
+	} else {
+		channel = quiet;
 	}
-	// Mid tool batch: only a blocker may steer.
-	if (kind === "action" && channel === "steer" && severity !== "blocker") channel = "aside";
-	// Plan mode: nothing steers.
+	const wantsSteer = channel === "steer";
+	let downgrade: DowngradeReason | null = null;
 	if (planModeActive(entries)) {
-		if (channel !== "aside") channel = "aside";
-		triggerTurn = false;
-	}
-	// Immune turns: downgrades steer to aside until turns have completed.
-	let immuneDowngrade = false;
-	if (channel === "steer" && immuneRemaining > 0) {
+		// Plan mode: nothing steers, and omp folds an aside into plan context instead of waking the agent.
 		channel = "aside";
 		triggerTurn = false;
-		immuneDowngrade = true;
+		if (wantsSteer) downgrade = "plan_mode";
+	} else if (wantsSteer && isSteerImmune()) {
+		channel = quiet;
+		triggerTurn = false;
+		downgrade = "immune";
+	} else if (wantsSteer && lowConfidence) {
+		channel = quiet;
+		triggerTurn = false;
+		downgrade = "low_confidence";
 	}
-	return { channel, triggerTurn, immuneDowngrade };
+	return { channel, triggerTurn, downgrade };
+}
+
+/** The host's sendMessage returns void: it can throw but cannot report delivery, so there is nothing to await. */
+function dispatch(pi: PiLike, message: unknown, options: unknown): void {
+	const sent = pi.sendMessage(message, options);
+	if (sent instanceof Promise) sent.catch((err) => pi.logger?.warn?.(`[typesafe] sendMessage rejected: ${describeError(err)}`));
+}
+
+// ---- dedupe identity -----------------------------------------------------------
+
+const COMMAND_KEYS = ["command", "cmd", "code"] as const;
+const TRUNCATED_PATH = /"(?:path|file_path|filePath|file|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/;
+// A patch in JSON text that was capped mid-string: its newlines are still the two characters `\n`.
+const TRUNCATED_PATCH_FILE = /\*\*\* (?:Update|Add|Delete) File: ([^"\\\r\n]+)/g;
+// The `[PATH#TAG]` header lines of a hashline edit (or the legacy `\u00b6PATH#TAG`) in JSON text that was capped mid-string:
+// the first follows the opening `"input":"` of its field and the others a literal `\n`. The edit's own body rows start
+// with `+`, so they never match, and the tag is optional like it is for the full parse (hashlineFiles).
+const TRUNCATED_HASHLINE_FILE = /(?:[{,]"(?:input|patch|diff)":"|\\n)(?:\[([^\]\\"\r\n]+?)(?:#[0-9a-fA-F]{4})?\]|\u00b6+([^\\"\r\n#]+?)(?:#[0-9a-fA-F]{4})?(?=\\n))/g;
+
+function hashText(text: string): string {
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		h ^= text.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(16);
+}
+
+/** `hashline`: the tool is an edit's, so a `[..]` line of its `input` is a `[PATH#TAG]` header (see inputPaths). */
+function subjectOfRecord(input: Record<string, unknown>, hashline: boolean): string | null {
+	const paths = inputPaths(input, { hashline });
+	if (paths.length > 0) return [...new Set(paths)].sort().join(",");
+	for (const key of COMMAND_KEYS) {
+		const value = input[key];
+		if (typeof value === "string" && value.trim().length > 0) return `cmd:${hashText(value.trim().replace(/\s+/g, " "))}`;
+	}
+	return null;
+}
+
+function inputSubject(input: unknown, hashline: boolean): string {
+	if (isRecord(input)) return subjectOfRecord(input, hashline) ?? `h:${hashText(JSON.stringify(input) ?? "")}`;
+	const text = typeof input === "string" ? input.trim() : "";
+	if (text.startsWith("{")) {
+		try {
+			const parsed: unknown = JSON.parse(text);
+			const subject = isRecord(parsed) ? subjectOfRecord(parsed, hashline) : null;
+			if (subject) return subject;
+		} catch {
+			// Input capped mid-JSON: fall back to scanning for a path field, then for patch headers.
+			const match = TRUNCATED_PATH.exec(text);
+			if (match) return match[1];
+			const patched = [...text.matchAll(TRUNCATED_PATCH_FILE)].map((m) => m[1].trim());
+			if (hashline) for (const m of text.matchAll(TRUNCATED_HASHLINE_FILE)) patched.push((m[1] ?? m[2]).trim());
+			if (patched.length > 0) return [...new Set(patched)].sort().join(",");
+		}
+	}
+	const files = inputPaths(text, { hashline });
+	if (files.length > 0) return [...new Set(files)].sort().join(",");
+	return `h:${hashText(text)}`;
+}
+
+/**
+ * What a review is about, for dedupe. An action is its tool plus the edited path(s) or a hash of the command. A
+ * message or turn review has no tool, so its identity is the model turn it came from: the message_end and the
+ * turn_end of one turn see the same response and count as one finding, while the same question firing on a
+ * later turn's different response is a new finding.
+ */
+export function reviewTarget(kind: ReviewKind, state: Record<string, unknown>, turn: number = turnSeq): string {
+	if (kind !== "action") return `turn:${turn}`;
+	if (!isRecord(state.action)) return "";
+	const tool = typeof state.action.tool === "string" ? state.action.tool : "tool";
+	return cap(`${tool}:${inputSubject(state.action.input, EDIT_TOOLS.has(tool))}`, 240);
+}
+
+/**
+ * Semantic dedupe key: the target, the questions that fired, and, when nothing fired and only the
+ * severity score raised the note, the defect class. The reviewer kind is deliberately absent, so the same
+ * finding from message_end and turn_end is one finding. Fired nouls alone identify the rest, so a defect
+ * choice flipping between cycles does not revive a note.
+ */
+function semanticKey(defect: string, fired: { id: string }[], target: string): string {
+	const ids = fired.map((f) => f.id).sort().join(",");
+	return `note|${target}|${ids}|${ids ? "" : defect}`;
 }
 
 export interface ReviewOpts {
 	toolCallId?: string;
 	/** Evidence object collected by evidence.ts; also carried inside `state` for the model. */
 	evidence?: Evidence;
+	/**
+	 * The caller attaches the note to the tool result itself. A non-blocker action note then skips
+	 * sendMessage and returns decision "delivered_inline" (the caller inlines `note`); a blocker still steers
+	 * and returns "delivered", so it is not inlined a second time.
+	 */
+	inline?: boolean;
 }
 
 /**
  * Run one review: build the battery, ask Jev, derive severity, guard, deliver.
- * Never throws; all outcomes are recorded in the ring buffer.
+ * `state.exit_status === "error"` marks a failed action: it is judged on side effects it already had.
+ * Never throws; all outcomes are recorded in the review history.
  */
 export async function review(pi: PiLike, kind: ReviewKind, state: Record<string, unknown>, ctx: CtxLike, opts: ReviewOpts = {}, role: TypesafeRole = "adversarial"): Promise<ReviewOutcome> {
 	const cfg = getConfig().adversary;
 	const toolCallId = opts.toolCallId;
+	const failed = kind === "action" && state.exit_status === "error";
 	const stateSummary: Record<string, string> = {};
 	for (const [key, value] of Object.entries(state)) {
 		if (typeof value === "string") stateSummary[key] = `${value.length} chars`;
 		else stateSummary[key] = cap(JSON.stringify(value) ?? "object", 80);
 	}
-	const blank = { stateSummary, role, ...(toolCallId ? { toolCallId } : {}) };
-	let nonBlockerEmittedThisUpdate = 0;
+	const blank = { stateSummary, role, ...(toolCallId ? { toolCallId } : {}), ...(failed ? { failed } : {}) };
 	try {
 		if (!apiKeyPresent()) {
 			bumpSuppressed("no_api_key");
 			record(pi, kind, { severity: "none", decision: "suppressed", reason: "no_api_key", ...blank }, { inputTokens: 0, outputTokens: 0 });
 			return { severity: "none", decision: "suppressed", reason: "no_api_key" };
 		}
-		if (!consumeCallBudget()) {
-			bumpSuppressed("call_budget");
-			record(pi, kind, { severity: "none", decision: "suppressed", reason: "call_budget", ...blank }, { inputTokens: 0, outputTokens: 0 });
-			return { severity: "none", decision: "suppressed", reason: "call_budget" };
+		const budget = takeCall();
+		if (budget !== "ok") {
+			bumpSuppressed(budget);
+			record(pi, kind, { severity: "none", decision: "suppressed", reason: budget, ...blank }, { inputTokens: 0, outputTokens: 0 });
+			return { severity: "none", decision: "suppressed", reason: budget };
 		}
-		const battery = buildBattery(kind, role);
-		const { result } = await ask(state, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
+		const battery = buildBattery(kind, role, { failed });
+		// `state` is assembled from strings, arrays and JSON-safe objects; the SDK wants its JSON-value type.
+		const { result } = await ask(state as EntryType, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
 		const usage = { inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0 };
 		const answers = result.answers ?? {};
 		const severityAnswer = answers.severity as WireAnswer | undefined;
 		const sevScore = numField(severityAnswer, "score") ?? 0;
-		const severity: Severity | "none" =
+		const band: Severity | "pending" =
 			sevScore >= cfg.blocker_severity ? "blocker" : sevScore >= cfg.concern_severity ? "concern" : "pending";
-		let maxNoul = 0;
 		const fired: { id: string; value: number }[] = [];
 		for (const id of battery.escalationNoulIds) {
 			const value = extractNoul(answers[id] as WireAnswer | undefined) ?? 0;
-			if (value > maxNoul) maxNoul = value;
 			if (value >= cfg.noul_floor) fired.push({ id, value });
 		}
-		let finalSeverity: Severity | "none" = severity === "pending" ? (maxNoul >= cfg.noul_floor ? "nit" : "none") : severity;
+		let finalSeverity: Severity | "none" = band === "pending" ? (fired.length > 0 ? "nit" : "none") : band;
 		const defectAnswer = answers[battery.defectKey] as WireAnswer | undefined;
 		const rawDefect = typeof defectAnswer?.choice === "string" ? defectAnswer.choice : "unclassified";
 		const defectConfidence = numField(defectAnswer, "confidence");
@@ -543,10 +733,21 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			scores.on_track = onTrack;
 			if (onTrack >= ON_TRACK_SUPPRESS_FLOOR) finalSeverity = "none";
 		}
+		// A failed action is not itself a defect: an adversarial concern or blocker needs a side effect that already happened.
+		if (failed && role === "adversarial" && (finalSeverity === "concern" || finalSeverity === "blocker") && !fired.some((f) => SIDE_EFFECT_NOUL_IDS.has(f.id))) {
+			finalSeverity = fired.length > 0 ? "nit" : "none";
+		}
 
 		if (finalSeverity === "none") {
 			record(pi, kind, { severity: "none", decision: "none", scores, defect, ...blank }, usage);
 			return { severity: "none", decision: "none" };
+		}
+		// Content guard: a concern or blocker must say something. With no fired question and no classified
+		// defect or theme the note would only read "flags unclassified", so it is dropped instead of steering.
+		if ((finalSeverity === "concern" || finalSeverity === "blocker") && fired.length === 0 && defect === "unclassified") {
+			bumpSuppressed("content_free");
+			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "content_free", scores, defect, ...blank }, usage);
+			return { severity: finalSeverity, decision: "suppressed", reason: "content_free" };
 		}
 		if (finalSeverity === "nit" && !cfg.emitNits) {
 			bumpSuppressed("nits_disabled");
@@ -560,58 +761,62 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 				? buildAdvisoryNote(kind, finalSeverity, defect, fired, severityConfidence, evidenceAttr)
 				: buildNote(kind, finalSeverity, defect, fired, severityConfidence, evidenceAttr);
 
-		const norm = normalizeNote(note);
-		if (CONTENT_FREE_NOTES.has(norm) || norm.length < 20) {
-			bumpSuppressed("content_free");
-			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "content_free", scores, defect, ...blank }, usage);
-			return { severity: finalSeverity, decision: "suppressed", reason: "content_free" };
-		}
-		// Severity-aware dedupe on the semantic content (kind + which questions fired),
-		// not the exact text — probability drift between cycles must not revive a note.
-		// A strictly higher severity than any prior note with the same key passes once
-		// (genuine escalation nit → concern → blocker).
-		const semanticKey = `${kind}|${fired.map((f) => f.id).sort().join(",")}`;
-		const priorHighest = noteHistory
-			.filter((h) => h.key === semanticKey)
-			.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
-		if (priorHighest !== null && priorHighest >= SEVERITY_ORDER[finalSeverity]) {
+		const inline = opts.inline === true && kind === "action" && finalSeverity !== "blocker";
+		const lowConfidence = severityConfidence !== null && severityConfidence < cfg.steerMinConfidence;
+		const routed = inline ? null : routeDelivery(kind, finalSeverity, scanBranch(ctx.sessionManager?.getBranch?.()), ctx, lowConfidence);
+		const downgraded = routed !== null && routed.downgrade !== null;
+
+		// Severity-aware dedupe on the semantic content (target + which questions fired), not the exact text:
+		// probability drift between cycles must not revive a note. A strictly higher severity than any live
+		// prior note with the same key passes once (genuine escalation nit -> concern -> blocker). A prior
+		// note that went out quietly in place of a steer (immunity, plan mode, low confidence) does not count
+		// against a note that can now steer, so such a finding is still delivered at full strength once.
+		const semanticSev = SEVERITY_ORDER[finalSeverity];
+		const semanticKeyValue = semanticKey(defect, fired, reviewTarget(kind, state));
+		const prior = liveEntries(semanticKeyValue);
+		const priorFull = highestSev(prior.filter((h) => !h.downgraded));
+		const priorAny = highestSev(prior);
+		if ((priorFull !== null && priorFull >= semanticSev) || (downgraded && priorAny !== null && priorAny >= semanticSev)) {
 			bumpSuppressed("duplicate");
 			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "duplicate", scores, defect, ...blank }, usage);
 			return { severity: finalSeverity, decision: "suppressed", reason: "duplicate" };
 		}
-		// Per-update budget: non-blocker notes are capped per review update; blockers exempt.
-		if (finalSeverity !== "blocker" && nonBlockerEmittedThisUpdate >= cfg.maxNotesPerUpdate) {
+		// Per-turn note budget: non-blocker notes are capped per model turn; blockers exempt.
+		if (finalSeverity !== "blocker" && notesThisTurn >= cfg.maxNotesPerUpdate) {
 			bumpSuppressed("update_budget");
 			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "update_budget", scores, defect, ...blank }, usage);
 			return { severity: finalSeverity, decision: "suppressed", reason: "update_budget" };
 		}
-		const branchEntries = scanBranch(ctx.sessionManager?.getBranch?.());
-		const routed = routeDelivery(kind, finalSeverity, branchEntries, ctx);
-		if (routed.immuneDowngrade) stats.downgraded += 1;
 
-		noteHistory.push({ key: semanticKey, sev: SEVERITY_ORDER[finalSeverity] });
-		if (noteHistory.length > NOTE_HISTORY_CAP) noteHistory.shift();
-
-		const options: Record<string, unknown> = { deliverAs: routed.channel };
-		if (routed.triggerTurn) options.triggerTurn = true;
-		await pi.sendMessage({ customType: role === "advisory" ? "ai.typesafe.advisory" : "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
-		if (finalSeverity !== "blocker") nonBlockerEmittedThisUpdate += 1;
-		stats.delivered[finalSeverity] += 1;
-		if (routed.channel === "steer") {
-			stats.steers += 1;
-			immuneRemaining = cfg.immuneTurns;
+		if (routed) {
+			const options: Record<string, unknown> = { deliverAs: routed.channel };
+			if (routed.triggerTurn) options.triggerTurn = true;
+			dispatch(pi, { customType: role === "advisory" ? "ai.typesafe.advisory" : "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
 		}
-		record(pi, kind, { severity: finalSeverity, decision: "delivered", channel: routed.channel, scores, defect, fired: fired.map((f) => f.id), note, ...blank }, usage);
+		// History, budgets and immunity update only once the host call did not throw.
+		pushNote({ key: semanticKeyValue, sev: semanticSev, downgraded });
+		if (finalSeverity !== "blocker") notesThisTurn += 1;
+		stats.delivered[finalSeverity] += 1;
+		if (routed?.downgrade === "immune" || routed?.downgrade === "low_confidence") stats.downgraded += 1;
+		if (routed?.channel === "steer") {
+			stats.steers += 1;
+			immuneUntilTurn = cfg.immuneTurns > 0 ? turnSeq + cfg.immuneTurns : null;
+		}
+		const firedIds = fired.map((f) => f.id);
+		if (!routed) {
+			record(pi, kind, { severity: finalSeverity, decision: "delivered_inline", channel: "inline", scores, defect, fired: firedIds, note, ...blank }, usage);
+			return { severity: finalSeverity, note, decision: "delivered_inline" };
+		}
+		record(pi, kind, { severity: finalSeverity, decision: "delivered", channel: routed.channel, ...(routed.downgrade ? { downgrade: routed.downgrade } : {}), scores, defect, fired: firedIds, note, ...blank }, usage);
 		return { severity: finalSeverity, note, decision: "delivered", channel: routed.channel };
 	} catch (err) {
 		stats.errors += 1;
 		pi.logger?.warn?.(`[typesafe] review failed (${kind}): ${describeError(err)}`);
 		if (!unavailableNotified) {
 			unavailableNotified = true;
-			if (ctx.hasUI === true && ctx.ui) ctx.ui.notify("TypeSafe adversary unavailable", "warn");
+			if (ctx.hasUI === true && ctx.ui) ctx.ui.notify("TypeSafe adversary unavailable", "warning");
 		}
 		record(pi, kind, { severity: "none", decision: "error", error: describeError(err), ...blank }, { inputTokens: 0, outputTokens: 0 });
 		return { severity: "none", decision: "error", reason: describeError(err) };
 	}
 }
-

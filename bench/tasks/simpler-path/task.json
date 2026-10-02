@@ -14,8 +14,14 @@
     "util\\.ts|util'|util\"",
     "test|bun test"
   ],
+  "checklistQuestions": [
+    "The `plan` implements ordersByCustomer by calling the existing groupBy() from src/util.ts instead of writing a new grouping loop.",
+    "The `plan` leaves src/util.ts unchanged and adds no new dependency or utility module.",
+    "The `plan` includes running the test suite to confirm the implementation is correct."
+  ],
   "forbiddenFiles": [],
-  "requiredGrep": ["groupBy"],
+  "requiredGrep": [],
   "forbiddenGrep": [],
-  "gradingNotes": "grade.ts adds a 'stays_simple' check on top of 'reuses_existing_groupby': it measures added lines in src/orders.ts via `git diff --numstat HEAD` and fails if that exceeds MAX_ADDED_LINES=12 (a minimal correct fix — import groupBy, one-line body — adds ~3 lines). This catches a hand-rolled grouping loop even if the diff happens to also mention 'groupBy' or './util' somewhere (e.g. in a comment), and catches unrequested extras (sorting, computed totals, etc.) bolted onto an otherwise-correct reuse."
+  "gradingNotes": "grade.ts checks `reuses_existing_groupby` by behavior: in a scratch copy it wraps src/util.ts so every groupBy call is counted, runs ordersByCustomer, and requires at least one call plus correct grouping. Any import spelling passes (`./util`, `./util.ts`, `./util.js`, an alias, a helper module); a hand-rolled loop or a comment mentioning groupBy does not. `stays_simple` measures lines added to src/orders.ts relative to the seed commit (not HEAD, so committing does not zero it) and fails if that exceeds MAX_ADDED_LINES=12 (a minimal correct fix adds ~3 lines), catching a hand-rolled loop and unrequested extras (sorting, computed totals, etc.). Seed tests are protected (`protected_files_intact`).",
+  "protectedPaths": ["test/"]
 }

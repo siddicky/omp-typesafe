@@ -1,10 +1,44 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import type { CellType } from "./telemetry";
 
 export interface ReviewerNote {
 	customType: string;
 	timestamp: string | null;
 	raw: unknown;
+}
+
+/** customTypes the extension's reviewer delivers its notes under (one per role). */
+export const REVIEWER_NOTE_TYPES: readonly string[] = ["ai.typesafe.adversary", "ai.typesafe.advisory"];
+/** customType of the ambiguity gate's own message; counted apart from reviewer notes. */
+export const GATE_NOTE_TYPE = "ai.typesafe.ambiguity";
+/** Written once per plan cell by omp when plan mode starts. */
+export const PLAN_MODE_CONTEXT_TYPE = "plan-mode-context";
+/** Marks the moment a plan is approved and execution begins. */
+export const PLAN_YOLO_HANDOFF_TYPE = "plan-yolo-handoff";
+
+/** True for a reviewer note, as opposed to omp's own custom messages (plan-mode-context, mid-run-todo-nudge, resolve-reminder, ...) or the gate's. */
+export function isReviewerNoteType(customType: string): boolean {
+	return REVIEWER_NOTE_TYPES.includes(customType);
+}
+
+/** Total of the reviewer-note entries in a customType-to-count map, ignoring every other customType. */
+export function sumReviewerNotes(counts: Record<string, number> | null | undefined): number {
+	let total = 0;
+	for (const [customType, count] of Object.entries(counts ?? {})) {
+		if (isReviewerNoteType(customType)) total += count;
+	}
+	return total;
+}
+
+/** How many ambiguity-gate messages the agent was shown. */
+export function countGateNotes(notes: ReviewerNote[]): number {
+	return notes.filter((n) => n.customType === GATE_NOTE_TYPE).length;
+}
+
+/** True if the session ran in plan mode, which omp marks with one `plan-mode-context` message per plan cell. */
+export function isPlanSession(notes: ReviewerNote[]): boolean {
+	return notes.some((n) => n.customType === PLAN_MODE_CONTEXT_TYPE);
 }
 
 /** Recursively find the newest .jsonl under a session-dir tree (encoded-cwd subdirs). */
@@ -36,23 +70,27 @@ export function findLatestSessionFile(sessionDir: string): string | null {
 }
 
 /**
- * Session JSONL: first 256 bytes are a fixed title slot, then one JSON object
- * per line (per the parent plan's confirmed session format). Lines that fail
- * to parse (e.g. the tail of the title header bleeding into line 1) are
- * dropped rather than throwing.
+ * Session JSONL: a fixed-width `title` record (omp pads it to 256 bytes, and
+ * it may be missing), then one JSON object per line. Every line is standalone
+ * JSON, so each is parsed on its own: no offset is assumed (a title with
+ * multibyte characters, or no title at all, would shift a character slice
+ * into the session header). The title record is skipped, and lines that fail
+ * to parse (a truncated tail) are dropped rather than throwing.
  */
 export function parseSessionEntries(path: string): unknown[] {
 	const text = readFileSync(path, "utf8");
-	const body = text.length > 256 ? text.slice(256) : text;
 	const entries: unknown[] = [];
-	for (const line of body.split("\n")) {
+	for (const line of text.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
+		let entry: unknown;
 		try {
-			entries.push(JSON.parse(trimmed));
+			entry = JSON.parse(trimmed);
 		} catch {
-			// skip malformed/partial line
+			continue; // malformed/partial line
 		}
+		if (entry && typeof entry === "object" && (entry as Record<string, unknown>).type === "title") continue;
+		entries.push(entry);
 	}
 	return entries;
 }
@@ -60,7 +98,9 @@ export function parseSessionEntries(path: string): unknown[] {
 /**
  * Custom-message notes appear as `type: "custom_message"` in the session
  * JSONL, and as `role: "custom"` in `--mode json` stdout (confirmed by the
- * team); both carry a string `customType`. Accepts either shape.
+ * team); both carry a string `customType`. Accepts either shape. Returns every
+ * custom message, omp's own included, because the plan-yolo-handoff marker is
+ * one of them; use `isReviewerNoteType` to pick out the reviewer's notes.
  */
 export function extractCustomMessages(entries: unknown[]): ReviewerNote[] {
 	const out: ReviewerNote[] = [];
@@ -85,25 +125,37 @@ export function extractCustomMessages(entries: unknown[]): ReviewerNote[] {
  * Absent for exec-type cells and for plan cells that never reached approval.
  */
 export function findPlanYoloHandoffTimestamp(notes: ReviewerNote[]): string | null {
-	const handoff = notes.find((n) => n.customType === "plan-yolo-handoff");
+	const handoff = notes.find((n) => n.customType === PLAN_YOLO_HANDOFF_TYPE);
 	return handoff?.timestamp ?? null;
 }
 
 /**
- * Buckets notes into plan-phase (before the plan-yolo-handoff timestamp) and
- * exec-phase (at or after it) counts by customType. If `handoffTs` is null
- * (exec-type cells, or a plan cell whose handoff marker wasn't found), every
- * timestamped note is treated as exec-phase and every untimestamped note is
- * dropped from both buckets rather than guessed at.
+ * Buckets reviewer notes into plan-phase (before the plan-yolo-handoff
+ * timestamp) and exec-phase (at or after it) counts by customType. Only
+ * reviewer notes are counted: omp's own custom messages and the ambiguity
+ * gate's (see `countGateNotes`) are not notes the reviewer wrote.
+ *
+ * If `handoffTs` is null, every timestamped note is exec-phase and every
+ * untimestamped note is dropped rather than guessed at, except for a plan
+ * cell. A plan cell with no handoff never had its plan approved, so the whole
+ * session ran in plan mode and every note goes to the plan phase. The cell
+ * type is `cellType` when given, else inferred from the session's own
+ * `plan-mode-context` message.
  */
 export function splitNoteCountsByPhase(
 	notes: ReviewerNote[],
 	handoffTs: string | null,
+	cellType?: CellType,
 ): { planPhaseNotes: Record<string, number>; execPhaseNotes: Record<string, number> } {
 	const planPhaseNotes: Record<string, number> = {};
 	const execPhaseNotes: Record<string, number> = {};
+	const unapprovedPlan = !handoffTs && (cellType ?? (isPlanSession(notes) ? "plan" : "exec")) === "plan";
 	for (const note of notes) {
-		if (note.customType === "plan-yolo-handoff") continue;
+		if (!isReviewerNoteType(note.customType)) continue;
+		if (unapprovedPlan) {
+			planPhaseNotes[note.customType] = (planPhaseNotes[note.customType] ?? 0) + 1;
+			continue;
+		}
 		if (!note.timestamp) continue;
 		const bucket = handoffTs && note.timestamp < handoffTs ? planPhaseNotes : execPhaseNotes;
 		bucket[note.customType] = (bucket[note.customType] ?? 0) + 1;
@@ -117,25 +169,36 @@ export interface UsageInfo {
 	messageCount: number;
 }
 
+function usageNumber(usage: Record<string, unknown>, key: string): number {
+	const v = usage[key];
+	return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
 /**
  * omp has no single session-summary usage event (confirmed: Phase 0 check 4).
- * Usage/cost is embedded per assistant message on `message_end` events as
- * `message.usage.totalTokens` and `message.usage.cost.total`. Sums across
- * every `message_end` entry found. Returns null if none are found (caller
- * decides whether to try a fallback source).
+ * Usage/cost is embedded per assistant message as `message.usage.totalTokens`
+ * and `message.usage.cost.total`: on `type: "message"` entries in the session
+ * JSONL, and on `type: "message_end"` events in `--mode json` stdout (hence
+ * `entryType`). Sums across every matching entry. Returns null if none are
+ * found (caller decides whether to try a fallback source).
  */
-function sumUsageFromEntries(entries: unknown[]): UsageInfo | null {
+function sumUsageFromEntries(entries: unknown[], entryType: "message" | "message_end"): UsageInfo | null {
 	let totalTokens = 0;
 	let costUsd = 0;
 	let messageCount = 0;
 	for (const e of entries) {
 		if (!e || typeof e !== "object") continue;
 		const rec = e as Record<string, unknown>;
-		if (rec.type !== "message_end") continue;
+		if (rec.type !== entryType) continue;
 		const message = rec.message as Record<string, unknown> | undefined;
-		const usage = message?.usage as Record<string, unknown> | undefined;
-		if (!usage) continue;
-		if (typeof usage.totalTokens === "number") totalTokens += usage.totalTokens;
+		if (!message || typeof message !== "object") continue;
+		if (typeof message.role === "string" && message.role !== "assistant") continue;
+		const usage = message.usage as Record<string, unknown> | undefined;
+		if (!usage || typeof usage !== "object") continue;
+		totalTokens +=
+			typeof usage.totalTokens === "number"
+				? usage.totalTokens
+				: usageNumber(usage, "input") + usageNumber(usage, "output") + usageNumber(usage, "cacheRead") + usageNumber(usage, "cacheWrite");
 		const cost = usage.cost as Record<string, unknown> | undefined;
 		if (typeof cost?.total === "number") costUsd += cost.total;
 		messageCount++;
@@ -143,9 +206,9 @@ function sumUsageFromEntries(entries: unknown[]): UsageInfo | null {
 	return messageCount > 0 ? { totalTokens, costUsd, messageCount } : null;
 }
 
-/** Sums usage across `message_end` events in the session JSONL (preferred source). */
+/** Sums usage across the assistant `message` entries of the session JSONL (preferred source). */
 export function usageFromSessionEntries(entries: unknown[]): UsageInfo | null {
-	return sumUsageFromEntries(entries);
+	return sumUsageFromEntries(entries, "message");
 }
 
 /** Sums usage across `message_end` events in `--mode json` stdout (NDJSON), used when no session file was found. */
@@ -160,5 +223,5 @@ export function usageFromStdout(stdout: string): UsageInfo | null {
 			// stdout may include non-JSON lines; skip them
 		}
 	}
-	return sumUsageFromEntries(entries);
+	return sumUsageFromEntries(entries, "message_end");
 }
