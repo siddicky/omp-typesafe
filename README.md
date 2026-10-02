@@ -670,6 +670,10 @@ attempt with one retry, capped at 12 s. A 429 whose `Retry-After` is longer than
 `rate_limited` instead of being retried; a shorter one (or none) is waited out and retried, within the retry count
 and the call's own cap. `/adversary status` shows session token usage and estimated cost.
 
+Local history scans defer formatting tool-call previews, captured write content and edit text until a consumer
+reads them. Metadata hooks therefore avoid repeating display work for old calls without changing the rendered
+evidence, its limits or the masking rules.
+
 ## Development
 
 ```sh
