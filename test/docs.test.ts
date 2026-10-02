@@ -326,4 +326,20 @@ describe("package scripts and CI", () => {
 	test("CI runs on pull requests, and on pushes only to main", () => {
 		expect(workflow).toMatch(/^on:\n\s+push:\n\s+branches: \[main\]\n\s+pull_request:/m);
 	});
+
+	// The trusted publisher on npmjs.com is bound to this exact file name and to the repository URL, and an OIDC publish
+	// needs `id-token: write` and npm 11.5.1 or newer. A stored token would bypass all of that.
+	test("the npm publish workflow publishes to npmjs.org through trusted publishing", () => {
+		const publish = read(".github/workflows/npm-publish-github-packages.yml");
+		expect(publish).toMatch(/^on:\n\s+release:\n\s+types: \[published\]/m);
+		expect(publish).toMatch(/^\s+id-token: write$/m);
+		expect(publish).toContain("registry-url: https://registry.npmjs.org");
+		expect(publish).toContain("npm install -g npm@^11.5.1");
+		expect(publish).not.toMatch(/NODE_AUTH_TOKEN|NPM_TOKEN|npm\.pkg\.github\.com|packages: write/);
+		const steps = [...publish.matchAll(/^\s+- run: (bun .+)$/gm)].map((m) => m[1]);
+		expect(steps).toEqual(["bun install --frozen-lockfile", "bun run typecheck", "bun test"]);
+		const repository = (JSON.parse(read("package.json")) as { repository?: { url?: string } }).repository;
+		expect(repository?.url).toBe("git+https://github.com/siddicky/omp-typesafe.git");
+		expect(readme).toContain("npm-publish-github-packages.yml");
+	});
 });

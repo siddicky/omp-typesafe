@@ -1,0 +1,67 @@
+name: Publish to npm
+
+# Publishes omp-typesafe to npmjs.org with npm trusted publishing (OIDC), so no npm token is stored anywhere. The
+# trusted publisher on npmjs.com names this file, which is why it keeps its old name (it used to publish to GitHub
+# Packages): renaming it means deleting the trusted publisher and creating a new one. Trusted publishing needs npm
+# 11.5.1 or newer, Node 22.14 or newer, a GitHub-hosted runner and `id-token: write`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.x
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@^11.5.1
+      # A release tag must name the version being published, and a version already on npm cannot be published again.
+      # npm 11 refuses a prerelease version without --tag, and a prerelease must not move `latest` anyway.
+      - id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          name=$(node -p 'require("./package.json").name')
+          if [ -n "$TAG" ] && [ "$TAG" != "v$version" ] && [ "$TAG" != "$version" ]; then
+            echo "::error::release tag $TAG does not match package.json version $version"
+            exit 1
+          fi
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "::error::$name@$version is already on npm; bump the version in package.json"
+            exit 1
+          fi
+          case "$version" in
+            *-*) echo "dist_tag=next" >> "$GITHUB_OUTPUT" ;;
+            *) echo "dist_tag=latest" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - run: npm publish --tag ${{ steps.version.outputs.dist_tag }}
