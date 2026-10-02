@@ -1,4 +1,4 @@
-import { cap, firstLine, isRecord, stringifyInput } from "./text";
+import { cap, firstLine, inputPaths, isRecord, MASK_HEADROOM, maskedCap, maskedFirstLine, maskedTail, sanitizeValue, stringifyInput } from "./text";
 
 /**
  * The single place omp branch-entry structure is interpreted.
@@ -8,7 +8,24 @@ import { cap, firstLine, isRecord, stringifyInput } from "./text";
 
 export interface ToolCallView {
 	name: string;
+	/** The input as omp recorded it (not copied); previewOf renders it, masked by key as well as by pattern. */
+	input: unknown;
+	/** First line of the input as JSON, unmasked, kept 4x as long as a prompt shows it (PREVIEW_MAX). */
 	inputPreview: string;
+	/** `path` / `file_path` input, when the call targets one. */
+	path: string | null;
+	/** Payload of a `write` call (capped); empty for every other tool. */
+	content: string;
+	/**
+	 * Edits of an `edit` call (capped); empty for every other tool. One line of JSON, except for a call whose whole
+	 * input is one patch string (omp's default hashline mode), which is kept as written.
+	 */
+	editText: string;
+	/**
+	 * Files an `edit` call without a `path` field names inside its input text (hashline `[PATH#TAG]` headers,
+	 * apply_patch headers); empty for every other call.
+	 */
+	editPaths: string[];
 }
 
 export interface MessageView {
@@ -21,10 +38,52 @@ export interface MessageView {
 }
 
 export interface EntryView {
+	/** omp's id for the session entry; null when the entry has none. Unique across the whole session tree. */
+	id: string | null;
 	type: string;
 	customType: string | null;
 	content: string;
 	message: MessageView | null;
+	/** `mode_change` entries only: the mode entered (`plan`, `none`, `plan_paused`, ...). */
+	mode: string | null;
+	/** `mode_change` entries only: `data.planFilePath`, when omp recorded one. */
+	planFilePath: string | null;
+}
+
+/** Cap on a captured `write` payload; enough for a plan file without keeping whole source files. */
+const WRITE_CONTENT_CAP = 8000;
+/** Longest preview of a tool call's input in the rendered delta and plan text. */
+const PREVIEW_MAX = 160;
+/** Cap on the edits of an `edit` call: a revision of a plan file is a few lines, not a rewrite. */
+const EDIT_TEXT_CAP = 1200;
+
+function stringField(record: Record<string, unknown> | null, ...keys: string[]): string | null {
+	if (!record) return null;
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return null;
+}
+
+function scanToolCall(block: Record<string, unknown>): ToolCallView {
+	const name = typeof block.name === "string" ? block.name : typeof block.toolName === "string" ? block.toolName : "tool";
+	const input = block.input ?? block.arguments ?? block.args;
+	const fields = isRecord(input) ? input : null;
+	const written = name === "write" ? fields?.content : undefined;
+	const path = stringField(fields, "path", "file_path");
+	// omp's default edit mode is hashline: `{ input: string }`, with the target only in the patch's header lines.
+	const patch = name === "edit" ? (typeof input === "string" ? input : stringField(fields, "input")) : null;
+	const editPaths = patch !== null && path === null ? inputPaths(input) : [];
+	return {
+		name,
+		input,
+		inputPreview: firstLine(stringifyInput(input, PREVIEW_MAX * MASK_HEADROOM), PREVIEW_MAX * MASK_HEADROOM),
+		path,
+		content: typeof written === "string" ? cap(written, WRITE_CONTENT_CAP) : "",
+		editText: name === "edit" ? (patch !== null && editPaths.length > 0 ? cap(patch, EDIT_TEXT_CAP) : stringifyInput(input, EDIT_TEXT_CAP)) : "",
+		editPaths,
+	};
 }
 
 function scanMessage(raw: Record<string, unknown>): MessageView {
@@ -37,8 +96,7 @@ function scanMessage(raw: Record<string, unknown>): MessageView {
 			if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
 				text += (text ? "\n" : "") + block.text;
 			} else if (block.type === "toolCall") {
-				const name = typeof block.name === "string" ? block.name : typeof block.toolName === "string" ? block.toolName : "tool";
-				toolCalls.push({ name, inputPreview: firstLine(stringifyInput(block.input ?? block.arguments ?? block.args, 400), 160) });
+				toolCalls.push(scanToolCall(block));
 			}
 		}
 	}
@@ -60,86 +118,187 @@ export function scanBranch(branch: unknown): EntryView[] {
 		if (!isRecord(raw)) continue;
 		const type = typeof raw.type === "string" ? raw.type : "";
 		const view: EntryView = {
+			id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id : null,
 			type,
 			customType: typeof raw.customType === "string" ? raw.customType : null,
 			content: typeof raw.content === "string" ? raw.content : "",
 			message: type === "message" && isRecord(raw.message) ? scanMessage(raw.message) : null,
+			mode: type === "mode_change" && typeof raw.mode === "string" ? raw.mode : null,
+			planFilePath: type === "mode_change" ? stringField(isRecord(raw.data) ? raw.data : null, "planFilePath") : null,
 		};
 		out.push(view);
 	}
 	return out;
 }
 
+/**
+ * A tool call's input as one line of at most PREVIEW_MAX characters. With `redact` on, the input is masked before it
+ * is written out and cut, by object key (everything under `password`, `tokens`, `credentials`, ... at any depth)
+ * as well as by pattern, the way an action review's input is: a pattern alone cannot see `{ tokens: ["..."] }`.
+ */
+function previewOf(call: ToolCallView, redact: boolean): string {
+	if (!redact) return maskedCap(call.inputPreview, PREVIEW_MAX, false);
+	const masked = sanitizeValue(call.input, true, { maxString: PREVIEW_MAX * MASK_HEADROOM });
+	return maskedCap(firstLine(stringifyInput(masked, PREVIEW_MAX * MASK_HEADROOM), PREVIEW_MAX * MASK_HEADROOM), PREVIEW_MAX, true);
+}
+
+/**
+ * The text helpers below take `redact`: with it on, secrets are masked before a text is cut to its cap, so a
+ * cut can never leave the front half of one (maskedCap).
+ */
+
 /** Most recent non-empty user message text (oldest-to-newest scan backwards). */
-export function lastUserText(entries: EntryView[], max = 1200): string {
+export function lastUserText(entries: EntryView[], max = 1200, redact = false): string {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i];
 		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) {
-			return cap(e.message.text, max);
+			return maskedCap(e.message.text, max, redact);
 		}
 	}
 	return "";
 }
 
 /** Most recent non-empty assistant message text — the claim under review. */
-export function claimedIntent(entries: EntryView[], max = 800): string {
+export function claimedIntent(entries: EntryView[], max = 800, redact = false): string {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const e = entries[i];
 		if (e.type === "message" && e.message?.role === "assistant" && e.message.text.trim().length > 0) {
-			return cap(e.message.text, max);
+			return maskedCap(e.message.text, max, redact);
 		}
 	}
 	return "";
 }
 
 /** Last `count` tool results as "tool: first-line" summaries, oldest first. */
-export function priorActions(entries: EntryView[], count: number): string[] {
+export function priorActions(entries: EntryView[], count: number, redact = false): string[] {
 	const out: string[] = [];
 	for (let i = entries.length - 1; i >= 0 && out.length < count; i--) {
 		const e = entries[i];
 		if (e.type === "message" && e.message?.role === "toolResult") {
-			out.push(`${e.message.toolName ?? "tool"}: ${firstLine(e.message.text, 120)}`);
+			out.push(`${e.message.toolName ?? "tool"}: ${maskedFirstLine(e.message.text, 120, redact)}`);
 		}
 	}
 	return out.reverse();
 }
 
 /** Render a delta of branch entries for turn review, capped. */
-export function renderDelta(entries: EntryView[], max = 6000): string {
+export function renderDelta(entries: EntryView[], max = 6000, redact = false): string {
 	const lines: string[] = [];
 	for (const e of entries) {
 		if (e.type !== "message" || !e.message) continue;
 		const m = e.message;
 		if (m.role === "user" && m.text.trim().length > 0) {
-			lines.push(`USER: ${cap(m.text, 800)}`);
+			lines.push(`USER: ${maskedCap(m.text, 800, redact)}`);
 		} else if (m.role === "assistant") {
-			if (m.text.trim().length > 0) lines.push(`ASSISTANT: ${cap(m.text, 1500)}`);
-			for (const tc of m.toolCalls) lines.push(`  call ${tc.name}: ${tc.inputPreview}`);
+			if (m.text.trim().length > 0) lines.push(`ASSISTANT: ${maskedCap(m.text, 1500, redact)}`);
+			for (const tc of m.toolCalls) lines.push(`  call ${tc.name}: ${previewOf(tc, redact)}`);
 		} else if (m.role === "toolResult") {
-			lines.push(`  result ${m.toolName ?? "tool"}${m.isError ? " (error)" : ""}: ${firstLine(m.text, 200)}`);
+			lines.push(`  result ${m.toolName ?? "tool"}${m.isError ? " (error)" : ""}: ${maskedFirstLine(m.text, 200, redact)}`);
 		}
 	}
 	return cap(lines.join("\n"), max);
 }
 
 /**
- * Substrings that mark a `custom`/`custom_message` entry as plan-mode context,
- * per the advisor doc's injected constraint context. Exported so callers and
- * tests can reference the exact marker set instead of duplicating it.
+ * `custom` / `custom_message` customTypes that mark plan mode as ON. omp
+ * injects `plan-mode-context` on every plan-mode prompt (and `omp --plan-yolo`
+ * writes no `mode_change`, so it is the only signal there). Exported so callers
+ * and tests can reference the exact marker set instead of duplicating it.
  */
-export const PLAN_MODE_MARKERS = ["plan-mode-context", "plan-mode-reference"] as const;
+export const PLAN_MODE_MARKERS = ["plan-mode-context"] as const;
 
 /**
- * Plan-mode detection: a `custom` or `custom_message` entry whose customType
- * contains one of PLAN_MODE_MARKERS among recent entries.
+ * customTypes that mark plan mode as OFF: `plan-mode-reference` is the
+ * execution-phase pointer at the approved plan (omp injects it only when plan
+ * mode is disabled) and `plan-yolo-handoff` is the plan-yolo approval that
+ * continues into execution in the same run.
+ */
+export const PLAN_EXIT_MARKERS = ["plan-mode-reference", "plan-yolo-handoff"] as const;
+
+type PlanSignal = "enter" | "exit" | null;
+
+/** Does this entry switch plan mode on, off, or say nothing about it? */
+function planSignal(e: EntryView): PlanSignal {
+	// omp's context builder keeps the last mode_change's mode as the current one, so
+	// anything but "plan" (none, plan_paused, goal, vibe, or a malformed entry) is an exit.
+	if (e.type === "mode_change") return e.mode === "plan" ? "enter" : "exit";
+	if ((e.type !== "custom" && e.type !== "custom_message") || e.customType === null) return null;
+	const customType = e.customType;
+	if (PLAN_EXIT_MARKERS.some((marker) => customType.includes(marker))) return "exit";
+	if (PLAN_MODE_MARKERS.some((marker) => customType.includes(marker))) return "enter";
+	return null;
+}
+
+/**
+ * Plan-mode detection: the most recent plan signal in the whole branch wins
+ * (no entry window, so a long planning turn cannot push its marker out). A
+ * `mode_change` to `plan` counts at once, before any prompt has been persisted.
  */
 export function planModeActive(entries: EntryView[]): boolean {
-	for (const e of entries.slice(-100)) {
-		if (e.type !== "custom" && e.type !== "custom_message") continue;
-		if (e.customType === null) continue;
-		if (PLAN_MODE_MARKERS.some((marker) => e.customType!.includes(marker))) {
-			return true;
-		}
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const signal = planSignal(entries[i]);
+		if (signal !== null) return signal === "enter";
 	}
 	return false;
 }
+
+/**
+ * Index (into `entries`) where the current plan began, or -1 when plan mode is not
+ * active: the earliest plan-entering entry since the last exit. omp appends another
+ * `mode_change` to `plan` mid-plan (at plan approval, when the plan file's path changes),
+ * and `--plan-yolo` writes no `mode_change` at all, so entries with no exit between them
+ * are one plan, not several.
+ */
+export function planStartIndex(entries: EntryView[]): number {
+	let start = -1;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const signal = planSignal(entries[i]);
+		if (signal === null) continue;
+		if (signal === "exit") break;
+		start = i;
+	}
+	return start;
+}
+
+/** Plan-mode sandbox drafts (`local://<slug>-plan.md`) and the `xd://propose` submission carry the plan itself. */
+function isPlanFilePath(path: string | null, known: Set<string>): boolean {
+	if (path === null) return false;
+	const p = path.trim();
+	return known.has(p) || p.startsWith("local://") || p.startsWith("xd://propose");
+}
+
+/**
+ * The plan as it stands: assistant text, tool-call previews, the content of
+ * plan-file writes (latest write per file) and the edits made to plan files since
+ * the plan began, newest kept when over `max`. `from` defaults to planStartIndex; no plan yields "".
+ */
+export function planSoFar(entries: EntryView[], max = 6000, from = planStartIndex(entries), redact = false): string {
+	if (from < 0 || from >= entries.length) return "";
+	const known = new Set<string>();
+	const latestWrite = new Map<string, string>();
+	for (let i = from; i < entries.length; i++) {
+		const e = entries[i];
+		if (e.planFilePath !== null) known.add(e.planFilePath);
+		e.message?.toolCalls.forEach((tc, j) => {
+			if (tc.name === "write" && tc.content.length > 0 && isPlanFilePath(tc.path, known)) latestWrite.set(tc.path!.trim(), `${i}:${j}`);
+		});
+	}
+	const lines: string[] = [];
+	for (let i = from; i < entries.length; i++) {
+		const m = entries[i].message;
+		if (!m || m.role !== "assistant") continue;
+		if (m.text.trim().length > 0) lines.push(`ASSISTANT: ${m.text}`);
+		m.toolCalls.forEach((tc, j) => {
+			const latest = tc.path === null ? undefined : latestWrite.get(tc.path.trim());
+			if (latest === `${i}:${j}`) lines.push(`  write ${tc.path}:\n${tc.content}`);
+			else if (latest !== undefined && tc.content.length > 0) lines.push(`  call write: ${tc.path} (superseded by a later write)`);
+			// A revision made with `edit` is part of the plan too: show more of it than the one-line preview does. A hashline
+			// edit has no `path` field; the file it names is in the patch text.
+			else if (tc.editText.length > 0 && isPlanFilePath(tc.path, known)) lines.push(`  edit ${tc.path}: ${tc.editText}`);
+			else if (tc.editText.length > 0 && tc.editPaths.some((p) => isPlanFilePath(p, known))) lines.push(`  edit ${tc.editPaths.find((p) => isPlanFilePath(p, known))}: ${tc.editText}`);
+			else lines.push(`  call ${tc.name}: ${previewOf(tc, redact)}`);
+		});
+	}
+	return maskedTail(lines.join("\n"), max, redact);
+}
+

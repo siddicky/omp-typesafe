@@ -1,5 +1,4 @@
-import { homedir } from "node:os";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { basename, dirname, join } from "node:path";
 import type { Questions } from "@typesafe-ai/sdk";
 import {
 	apiKeyPresent,
@@ -7,33 +6,38 @@ import {
 	choice,
 	describeError,
 	estimateCostUsd,
+	getClientError,
 	getLastResolvedModel,
 	getSessionUsage,
 	noul,
 	resetClient,
 	resetUsage,
 	score,
+	setClientLogger,
 } from "./client";
 import type { WireAnswer } from "./client";
-import { getConfig, loadConfig } from "./config";
+import { agentDir, getConfig, getConfigWarnings, loadConfig, subagentGuardEnabled } from "./config";
 import type { TypesafeRole } from "./config";
+import type { ExtensionAPI, HostContentBlock, HostContext, HostEvents, HostLogger, HostMessage, NotifyLevel, ZodSchema } from "./host";
 import { loadPriorities } from "./priorities";
-import { collectEvidence, recordAction, repoOutline, resetEvidenceTurn } from "./evidence";
-import type { Evidence } from "./evidence";
-import { claimedIntent, lastUserText, planModeActive, priorActions, renderDelta, scanBranch } from "./branch";
+import { getSubagentStats, resetSubagentStats, skipSubagent } from "./subagent";
+import { captureBaseline, collectEvidence, collectStatus, recordAction, repoOutline, resetEvidenceTurn } from "./evidence";
+import type { CollectOptions, Evidence } from "./evidence";
+import { claimedIntent, lastUserText, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch } from "./branch";
 import type { EntryView } from "./branch";
 import {
+	beginPrompt,
 	beginTurn,
 	canReviewMessage,
 	endTurn,
 	getLastReviewRecord,
 	getReviewHistory,
 	getReviewStats,
+	hasCallBudget,
+	isSteerImmune,
 	recordMessageReviewed,
 	resetReviewerSession,
 	review,
-	shouldEmit,
-	isSteerImmune,
 } from "./reviewer";
 import {
 	asksObserved,
@@ -43,15 +47,21 @@ import {
 	getAmbiguityTelemetry,
 	getAsks,
 	getLastAmbiguityScore,
+	getUserReplies,
 	isProposeWrite,
+	markSteered,
+	noteProposeBlock,
 	proposeDecision,
-	recordAsk,
+	recordAskResult,
+	recordFollowUp,
 	recordScore,
+	resetAmbiguityPlan,
 	resetAmbiguitySession,
 	scoreAmbiguity,
+	steerDecision,
 } from "./ambiguity";
 import type { AmbiguityResult, GateDecision, GateTrigger } from "./ambiguity";
-import { cap, fmt2, isRecord, stringifyInput, textFromContent } from "./text";
+import { EDIT_TOOLS, fmt2, inputPaths, isRecord, maskedCap, maskedTail, sanitizeValue, stringifyInput, textFromContent } from "./text";
 
 /**
  * TypeSafe Adversary — advisor-pattern adversarial reviewer for omp, powered by
@@ -59,43 +69,64 @@ import { cap, fmt2, isRecord, stringifyInput, textFromContent } from "./text";
  * deltas; raises nit/concern/blocker notes; exposes the typesafe_ask tool.
  */
 
-// omp host API types ship with the host package, which is not a dependency of
-// this plugin; the host injects a Zod-compatible schema builder and a logger.
-interface ZodSchemaLike {
-	optional(): ZodSchemaLike;
-}
-
-interface ZodBuilder {
-	object(shape: Record<string, ZodSchemaLike>): ZodSchemaLike;
-	string(): ZodSchemaLike;
-	enum(...values: string[]): ZodSchemaLike;
-	array(item: ZodSchemaLike): ZodSchemaLike;
-	record(key: ZodSchemaLike, value: ZodSchemaLike): ZodSchemaLike;
-}
-
-interface LoggerLike {
-	debug?(...args: unknown[]): void;
-	info?(...args: unknown[]): void;
-	warn?(...args: unknown[]): void;
-	error?(...args: unknown[]): void;
-}
-
-interface NotifyCtx {
-	hasUI?: boolean;
-	ui?: { notify(message: string, level?: string): unknown };
-}
-
 let priorities = "";
 let turnCursor = 0;
 const reviewedCallIds = new Set<string>();
 let sessionOverride: boolean | null = null;
 let sessionRoleOverride: TypesafeRole | null = null;
+let sessionGateOverride: boolean | null = null;
 let stopGateUses = 0;
+/** HEAD at the start of the prompt, so a commit made mid-prompt is still reviewed. */
+let baseline: string | null = null;
+// Per-plan gate state. resetPlanState() clears it whenever a plan starts or ends.
+let planStart = -1;
+/** omp's id of the entry the plan began at; null when the plan has none, or none is known. */
+let planStartId: string | null = null;
+/**
+ * omp's id of the first user message at or after the plan's start, once there is one: the plan's objective. Sibling
+ * branches (/branch, /tree) hang under the same start entry, so only this tells a reworded prompt's plan from the old one.
+ */
+let planFirstUserId: string | null = null;
 let planStartScored = false;
 let planPrompt = "";
+/** planPrompt came from before_agent_start's event.prompt, and the user message_end that carries that prompt has not arrived yet. */
+let planPromptAwaitingEcho = false;
+let planOutline: string | null = null;
+
+/** Tools whose failure can still leave side effects behind: an errored result is reviewed. */
+const REVIEW_WHEN_FAILED = new Set(["bash", "eval"]);
+
+/**
+ * Did an errored bash/eval result come from a command that ran and failed? omp reports that in the result's
+ * `details`: bash a non-zero `exitCode` (or `timedOut`), eval a cell with a non-zero `exitCode`. A call omp
+ * stopped (Esc), blocked, or got no exit status for is thrown instead and has no details, and a cancelled eval
+ * cell has no exit code. Only these details tell a failure from an abort: omp's `[Command aborted]` marker is
+ * absent from an auto-backgrounded command that was aborted, and present in the output of any command that
+ * merely prints it, so the output of a result that has them is never read for it (see interruptedBatch for the
+ * results that do not).
+ */
+function ranAndFailed(toolName: string, details: unknown): boolean {
+	if (!isRecord(details)) return false;
+	if (toolName === "bash") return details.timedOut === true || (typeof details.exitCode === "number" && details.exitCode !== 0);
+	if (toolName === "eval") return Array.isArray(details.cells) && details.cells.some((cell) => isRecord(cell) && typeof cell.exitCode === "number" && cell.exitCode !== 0);
+	return false;
+}
+
+/** `/typesafe test` cannot be cancelled, so one try plus one retry, and a hard cap on the whole probe. */
+const PROBE_TIMEOUT_MS = 10_000;
+const PROBE_BUDGET_MS = 12_000;
+/** A gate evaluation waits at most this long beyond its Jev timeout (one git probe, 1.5 s, plus slack). */
+const GATE_SLACK_MS = 1800;
+/** Hard ceiling, well under omp's 30 s fail-closed tool_call timeout, whatever ambiguityGate.timeoutMs says. */
+const GATE_DEADLINE_CAP_MS = 9000;
 
 function reviewEnabled(): boolean {
 	return sessionOverride ?? getConfig().adversary.enabled;
+}
+
+/** `/adversary gate` wins; otherwise `/adversary off` silences the gate too, and the config decides. */
+function gateEnabled(): boolean {
+	return sessionGateOverride ?? (sessionOverride === false ? false : getConfig().ambiguityGate.enabled);
 }
 
 function resolvedRole(): TypesafeRole {
@@ -112,9 +143,171 @@ function phaseAllowed(entries: EntryView[]): boolean {
 	return planModeActive(entries) ? phases.includes("plan") : phases.includes("execute");
 }
 
-function notifyVia(ctx: NotifyCtx | undefined, logger: LoggerLike | undefined, message: string, level = "info"): void {
+function notifyVia(ctx: HostContext | undefined, logger: HostLogger | undefined, message: string, level: NotifyLevel = "info"): void {
 	if (ctx?.hasUI === true && ctx.ui) ctx.ui.notify(message, level);
 	else logger?.info?.(`[typesafe] ${message}`);
+}
+
+/** A model turn that ended because the user aborted or the provider failed; its output is not worth reviewing. */
+function endedAbnormally(message: unknown): boolean {
+	return isRecord(message) && (message.stopReason === "aborted" || message.stopReason === "error");
+}
+
+/** The start of the result omp gives a tool call it never started because the run was already stopped. */
+const RUN_STOPPED_PREFIX = "Tool was not executed because the run was aborted";
+/**
+ * What a tool that was cut off by the user's abort reports as its whole text: ToolAbortError's message (any tool that
+ * checks its signal throws it, and omp turns the throw into an errored result with no details), the browser and
+ * computer workers' fallback, bash's own, and the wording of the tools that give their own: `ask` (a cancelled
+ * dialog aborts the run) and the browser's tab and page opens.
+ */
+const ABORT_TEXTS = new Set([
+	"Operation aborted",
+	"Tool call aborted",
+	"Command aborted",
+	"Ask tool was cancelled by the user",
+	"Ask input was cancelled",
+	"Browser open aborted",
+	"Browser tab open aborted",
+]);
+/**
+ * omp's own mark of a bash/eval call the user stopped: a leading `[Command cancelled]`, or `[Command aborted]` closing
+ * the output (a one-line notice about the saved output may follow it). It is looked for before the wording below,
+ * because the output of a stopped command can start or end with anything.
+ */
+const COMMAND_STOPPED_START = "[Command cancelled]";
+const COMMAND_STOPPED_END = /\[Command aborted\](?:\n\n\[(?!Command timed out)[^\n]*\])?\s*$/;
+/**
+ * How omp words a bash/eval call that did not complete without the user stopping it: the bash interceptor's block, a
+ * result with no exit status, a timeout. An errored command with no exit code or timeout in its details is taken
+ * for a stop (omp reports a stop with no details, in wording that is not always the same, see ranAndFailed), unless
+ * the start of its text matches the first of these or the end of it the second, and it carries no mark of a stop
+ * (COMMAND_STOPPED_*). Command output can be huge, so only NOT_STOPPED_EDGE characters of each end are looked at.
+ */
+const COMMAND_NOT_STOPPED_START = /^(?:Blocked: |Command blocked$|Command timed out$)/;
+const COMMAND_NOT_STOPPED_END = /Command failed: missing exit status|\[Command timed out after \d+ seconds\]$/;
+const NOT_STOPPED_EDGE = 300;
+
+function resultText(content: unknown): string {
+	return textFromContent(content, Number.MAX_SAFE_INTEGER).trim();
+}
+
+/**
+ * Did the user stop (Esc) the tool batch this turn ended with? omp ends such a turn as usual, with the assistant
+ * message's own `toolUse` stop reason, so only the turn's tool results show it. Any tool's result can: an
+ * omp-synthesised one (`details.__synthetic`: the tool never ran; `__interrupted`: it was skipped for a queued
+ * message), omp's own "not executed because the run was aborted" result of a call it never started, and the
+ * errored result of a call that threw ToolAbortError, whose whole text is "Operation aborted" or one of the few other
+ * wordings of ABORT_TEXTS. An errored bash/eval result is also taken for a stop unless it is a command that ran and
+ * failed (the call tool_result skips, see ranAndFailed) or omp worded it as a block, a missing exit status or a
+ * timeout (COMMAND_NOT_STOPPED_*) and it carries no mark of a stop: the other errors omp throws for those tools say
+ * nothing a reader can tell from a stop.
+ */
+function interruptedBatch(toolResults: unknown): boolean {
+	if (!Array.isArray(toolResults)) return false;
+	return toolResults.some((result) => {
+		if (!isRecord(result) || result.isError !== true) return false;
+		if (isRecord(result.details) && (result.details.__synthetic === true || result.details.__interrupted === true)) return true;
+		const toolName = typeof result.toolName === "string" ? result.toolName : "";
+		const command = REVIEW_WHEN_FAILED.has(toolName);
+		if (command && ranAndFailed(toolName, result.details)) return false;
+		const text = resultText(result.content);
+		if (ABORT_TEXTS.has(text) || text.startsWith(RUN_STOPPED_PREFIX)) return true;
+		if (!command) return false;
+		const tail = text.slice(-NOT_STOPPED_EDGE);
+		if (text.startsWith(COMMAND_STOPPED_START) || COMMAND_STOPPED_END.test(tail)) return true;
+		return !COMMAND_NOT_STOPPED_START.test(text.slice(0, NOT_STOPPED_EDGE)) && !COMMAND_NOT_STOPPED_END.test(tail);
+	});
+}
+
+/** The shell command or code a bash/eval call ran, for the commands-run evidence. */
+function commandText(input: unknown): string | undefined {
+	if (typeof input === "string") return input;
+	if (!isRecord(input)) return undefined;
+	for (const key of ["command", "cmd", "code"]) {
+		const value = input[key];
+		if (typeof value === "string" && value.trim().length > 0) return value;
+	}
+	return undefined;
+}
+
+/** Paths an edit-class tool call targets (the evidence starts with their diffs); capped. */
+function editedPaths(input: unknown): string[] {
+	return inputPaths(input).slice(0, 8);
+}
+
+/** How much of a tool call's input, as JSON, is shown to the reviewer. */
+const TOOL_INPUT_CAP = 3000;
+
+function redactOn(): boolean {
+	return getConfig().adversary.redact;
+}
+
+function sanitizeState(state: Record<string, unknown>): Record<string, unknown> {
+	return sanitizeValue(state, redactOn()) as Record<string, unknown>;
+}
+
+/** Plan text with the plan write that is being submitted right now, in case the host has not persisted it yet. */
+function withProposed(soFar: string, proposed: string | undefined, max = 6000): string {
+	const text = proposed?.trim() ?? "";
+	if (text.length === 0 || soFar.includes(text.slice(0, 200))) return soFar;
+	const joined = soFar ? `${soFar}\n  write xd://propose:\n${text}` : `  write xd://propose:\n${text}`;
+	return maskedTail(joined, max, redactOn());
+}
+
+/** First user message at or after `from`: the plan's objective once it is in the branch. */
+function firstUserTextFrom(entries: EntryView[], from: number): string {
+	for (let i = Math.max(0, from); i < entries.length; i++) {
+		const e = entries[i];
+		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) return maskedCap(e.message.text.trim(), 4000, redactOn());
+	}
+	return "";
+}
+
+/** omp's id of the first user message at or after `from`; null when there is none, or it has no id. */
+function firstUserIdFrom(entries: EntryView[], from: number): string | null {
+	for (let i = Math.max(0, from); i < entries.length; i++) {
+		const e = entries[i];
+		if (e.type === "message" && e.message?.role === "user" && e.message.text.trim().length > 0) return e.id;
+	}
+	return null;
+}
+
+/**
+ * The stop event's final assistant message as text. omp passes its AssistantMessage object (a `content` array of
+ * blocks); a plain string is accepted too.
+ */
+function lastMessageText(message: unknown): string {
+	if (typeof message === "string") return message.trim();
+	return isRecord(message) ? textFromContent(message.content, 2000, redactOn()).trim() : "";
+}
+
+/** Directory for /adversary dump: omp keeps its logs next to the agent dir (~/.omp/agent -> ~/.omp/logs). */
+function dumpDir(): string {
+	const dir = agentDir();
+	return basename(dir) === "agent" ? join(dirname(dir), "logs") : join(dir, "logs");
+}
+
+function safeFileId(id: unknown): string {
+	const text = typeof id === "string" || typeof id === "number" ? String(id) : "unknown";
+	return text.replace(/[^\w.-]/g, "_").slice(0, 80) || "unknown";
+}
+
+/** Resolve with the work's result, or null once `ms` has passed; the work is told to stop via its signal. */
+async function withDeadline<T>(work: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T | null> {
+	const controller = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<null>((resolve) => {
+		timer = setTimeout(() => {
+			controller.abort();
+			resolve(null);
+		}, ms);
+	});
+	try {
+		return await Promise.race([work(controller.signal), expired]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function answerNumber(answer: WireAnswer | undefined, key: string): number | null {
@@ -176,13 +369,26 @@ function normalizeOptions(options: unknown): Record<string, string> | undefined 
 	return undefined;
 }
 
+/** What the model passes to typesafe_ask; the host validates it against the schema registered below. */
+interface AskToolParams {
+	state: string;
+	stateFormat?: "text" | "json";
+	questions: unknown;
+	model?: string;
+}
+
+/** The API allows at most this many options in one choice question. */
+const MAX_CHOICE_OPTIONS = 255;
+
 function buildWireQuestions(items: unknown): { questions?: Questions; error?: string } {
 	if (!Array.isArray(items) || items.length === 0) return { error: "questions must be a non-empty array" };
 	const questions: Questions = {};
 	for (const raw of items) {
 		if (!isRecord(raw)) return { error: "each question must be an object" };
 		const id = typeof raw.id === "string" ? raw.id : "";
-		if (!id) return { error: "question.id is required" };
+		if (!id || id === "__proto__") return { error: "question.id is required" };
+		// Answers come back keyed by id, so a repeated id would silently drop the earlier question.
+		if (Object.hasOwn(questions, id)) return { error: `duplicate question id: ${id}` };
 		const type = raw.type;
 		const instructions = typeof raw.instructions === "string" ? raw.instructions : "";
 		if (type === "noul") {
@@ -192,11 +398,13 @@ function buildWireQuestions(items: unknown): { questions?: Questions; error?: st
 		} else if (type === "choice") {
 			const criteria = normalizeOptions(raw.options);
 			if (!criteria || Object.keys(criteria).length < 2) return { error: `question ${id}: choice requires options with at least 2 entries` };
+			if (Object.keys(criteria).length > MAX_CHOICE_OPTIONS) return { error: `question ${id}: choice allows at most ${MAX_CHOICE_OPTIONS} options` };
 			questions[id] = choice(instructions, criteria);
 		} else if (type === "score") {
 			const levels = Array.isArray(raw.levels) ? raw.levels.filter((l): l is string => typeof l === "string") : [];
 			if (levels.length < 2 || levels.length > 10) return { error: `question ${id}: score requires 2-10 levels` };
-			questions[id] = score(instructions, levels);
+			const [lowest, next, ...higher] = levels;
+			questions[id] = score(instructions, [lowest, next, ...higher]);
 		} else {
 			return { error: `question ${id}: type must be noul, choice, or score` };
 		}
@@ -209,87 +417,232 @@ function buildWireQuestions(items: unknown): { questions?: Questions; error?: st
  * "none" decision and the plan-mode flow continues untouched.
  */
 
-interface GateCtxLike {
-	cwd?: string;
-	hasUI?: boolean;
-	sessionManager: { getBranch(): unknown[] };
+interface GateRunOptions {
+	/** `git status` text the caller already collected this turn (the turn review's evidence). */
+	status?: string;
+	/** Content of the `xd://propose` write being gated, appended to the plan text when not yet in the branch. */
+	proposed?: string;
 }
 
-/** Assistant text seen so far this plan, plus any plan file content written. */
-function planSoFar(entries: EntryView[], max = 6000): string {
-	const lines: string[] = [];
-	for (const e of entries) {
-		if (e.type !== "message" || !e.message) continue;
-		if (e.message.role === "assistant" && e.message.text.trim().length > 0) lines.push(e.message.text);
-	}
-	return cap(lines.join("\n"), max);
+interface SteerOptions extends Pick<GateRunOptions, "status"> {
+	/** Hand the note back to the caller (before_agent_start's `{ message }`) instead of queueing an aside. */
+	asReturn?: boolean;
 }
 
 export default function typesafeExtension(pi: ExtensionAPI) {
 	pi.setLabel("TypeSafe Adversary");
-	const logger = pi.logger as LoggerLike | undefined;
-	const z = pi.zod as ZodBuilder;
+	const logger = pi.logger;
+	const z = pi.zod;
 
-	pi.on("session_start", async (_event, ctx) => {
+	/**
+	 * `pi.on` for every hook below: in a subagent session the handler does not run and its event gets no answer, so
+	 * a subagent never touches the parent's state, reviews, gates or writes the bench log (see src/subagent.ts).
+	 * The tool and the commands are not hooks and work from any session.
+	 */
+	const on = <K extends keyof HostEvents>(
+		event: K,
+		handler: (event: HostEvents[K]["event"], ctx: HostContext) => HostEvents[K]["result"] | Promise<HostEvents[K]["result"]>,
+	): void => {
+		pi.on(event, (e, ctx) => (skipSubagent(ctx) ? (undefined as HostEvents[K]["result"]) : handler(e, ctx)));
+	};
+
+	/** Scan the branch and notice when a plan has started or ended, so per-plan state never outlives its plan. */
+	const branchEntries = (ctx: { sessionManager: { getBranch(): unknown } }): EntryView[] => {
+		const entries = scanBranch(ctx.sessionManager.getBranch());
+		const start = planStartIndex(entries);
+		const startId = start >= 0 ? entries[start].id : null;
+		const firstUserId = start >= 0 ? firstUserIdFrom(entries, start) : null;
+		// A different plan: another start, or another objective under the same start (a sibling branch, or one that no
+		// longer holds the prompt the state was built from). The objective's own first arrival is not a change.
+		if (start !== planStart || startId !== planStartId || (planFirstUserId !== null && firstUserId !== planFirstUserId)) {
+			planStart = start;
+			planStartId = startId;
+			planFirstUserId = null;
+			resetPlanState();
+		}
+		if (planFirstUserId === null) planFirstUserId = firstUserId;
+		return entries;
+	};
+
+	const resetPlanState = (): void => {
+		planStartScored = false;
+		planPrompt = "";
+		planPromptAwaitingEcho = false;
+		planOutline = null;
+		resetAmbiguityPlan();
+	};
+
+	const reloadPriorities = async (cwd: string | undefined, role: TypesafeRole): Promise<void> => {
+		try {
+			priorities = await loadPriorities(cwd ?? process.cwd(), role);
+		} catch (err) {
+			priorities = "";
+			logger?.warn?.(`[typesafe] priorities not loaded: ${describeError(err)}`);
+		}
+	};
+
+	/** Everything that belongs to one session: config, client, reviewer and gate state, overrides. */
+	const resetSessionState = async (ctx: HostContext, announceMissingKey: boolean): Promise<void> => {
 		await loadConfig(logger);
+		setClientLogger(logger);
 		sessionOverride = null;
 		sessionRoleOverride = null;
-		priorities = await loadPriorities(ctx.cwd, resolvedRole());
+		sessionGateOverride = null;
+		await reloadPriorities(ctx.cwd, resolvedRole());
 		resetUsage();
 		resetClient();
 		resetReviewerSession();
 		resetEvidenceTurn();
+		resetSubagentStats();
 		reviewedCallIds.clear();
 		stopGateUses = 0;
+		baseline = null;
 		resetAmbiguitySession();
-		planStartScored = false;
-		planPrompt = "";
-		turnCursor = ctx.sessionManager.getBranch().length;
+		planStart = -1;
+		planStartId = null;
+		planFirstUserId = null;
+		resetPlanState();
+		turnCursor = scanBranch(ctx.sessionManager.getBranch()).length;
 		pi.setLabel(roleLabel(resolvedRole()));
-		if (!apiKeyPresent()) {
+		for (const warning of getConfigWarnings()) notifyVia(ctx, logger, warning, "warning");
+		if (announceMissingKey && !apiKeyPresent()) {
 			logger?.warn?.("[typesafe] TYPESAFE_API_KEY is not set; adversary and typesafe_ask stay inactive");
-			notifyVia(ctx, logger, "TypeSafe adversary inactive: TYPESAFE_API_KEY not set", "warn");
+			notifyVia(ctx, logger, "TypeSafe adversary inactive: TYPESAFE_API_KEY not set", "warning");
 		}
+	};
+
+	// omp emits session_start for the main session once per process (and once for every subagent session, which the
+	// guard skips); /new, /resume, fork and plan approval arrive as session_switch.
+	on("session_start", async (_event, ctx) => {
+		await resetSessionState(ctx, true);
+	});
+	on("session_switch", async (_event, ctx) => {
+		await resetSessionState(ctx, false);
 	});
 
 	const resetCursor = async (_event: unknown, ctx: { sessionManager: { getBranch(): unknown[] } }) => {
-		turnCursor = Math.max(0, ctx.sessionManager.getBranch().length);
+		turnCursor = scanBranch(ctx.sessionManager.getBranch()).length;
 	};
-	pi.on("session_switch", resetCursor);
-	pi.on("session_branch", resetCursor);
-	pi.on("session_compact", resetCursor);
+	// Another branch may hold another plan that starts at the very same index, or the same start entry with another first
+	// prompt (a sibling made by /branch). omp's entry ids tell them apart (the plan's own start entry and first prompt are
+	// still there after a navigation within it), so branchEntries drops the state only when an id changed; with no id to
+	// go by, assume another plan. The plan's first prompt is such an id too, and while it is unknown (before_agent_start
+	// recorded the prompt, but the turn died before the message reached the branch) a first prompt that the branch
+	// holds after a navigation can only be a sibling's, made by /branch or /tree under the same start entry.
+	const resetCursorAndPlan = async (event: unknown, ctx: { sessionManager: { getBranch(): unknown[] } }) => {
+		if (planStartId === null) {
+			planStart = -1;
+		} else if (planFirstUserId === null) {
+			const entries = scanBranch(ctx.sessionManager.getBranch());
+			const start = planStartIndex(entries);
+			if (start >= 0 && firstUserIdFrom(entries, start) !== null) planStart = -1;
+		}
+		await resetCursor(event, ctx);
+	};
+	on("session_branch", resetCursorAndPlan);
+	on("session_tree", resetCursorAndPlan);
+	on("session_compact", resetCursor);
 
-	pi.on("turn_start", async () => {
-		beginTurn();
+	/** One user prompt: reset the per-prompt budgets and the command log, and pin the HEAD to diff against. */
+	on("agent_start", async (_event, ctx) => {
+		beginPrompt();
 		resetEvidenceTurn();
+		stopGateUses = 0;
+		baseline = null;
+		try {
+			if (reviewEnabled() && getConfig().adversary.evidence && apiKeyPresent()) baseline = await captureBaseline(pi, ctx.cwd);
+		} catch (err) {
+			logger?.warn?.(`[typesafe] baseline capture failed: ${describeError(err)}`);
+		}
+	});
+
+	/** One model call (plus its tool runs). */
+	on("turn_start", async (event) => {
+		beginTurn(isRecord(event) && typeof event.turnIndex === "number" ? event.turnIndex : undefined);
 		reviewedCallIds.clear();
 	});
 
+	const evidenceOptions = (focusPaths?: string[]): CollectOptions => ({
+		...(focusPaths && focusPaths.length > 0 ? { focusPaths } : {}),
+		...(baseline ? { baseline } : {}),
+		redact: getConfig().adversary.redact,
+	});
+
+	/** Queue a host message; sendMessage returns void, so all that can be reported is that it did not throw. */
+	const send = (message: HostMessage, options: { deliverAs: "aside" }): boolean => {
+		try {
+			const sent: unknown = pi.sendMessage(message, options);
+			if (sent instanceof Promise) sent.catch((err) => logger?.warn?.(`[typesafe] sendMessage rejected: ${describeError(err)}`));
+			return true;
+		} catch (err) {
+			logger?.warn?.(`[typesafe] sendMessage failed: ${describeError(err)}`);
+			return false;
+		}
+	};
+
 	// ---- ambiguity gate ------------------------------------------------------
+
+	/** Is omp's `ask` tool active? Headless runs have none; without the host API, only a UI implies one. */
+	const askToolActive = (ctx: { hasUI?: boolean }): boolean => {
+		try {
+			const tools: unknown = pi.getActiveTools?.();
+			if (Array.isArray(tools)) return tools.includes("ask");
+		} catch (err) {
+			logger?.debug?.(`[typesafe] getActiveTools failed: ${describeError(err)}`);
+		}
+		return ctx.hasUI === true;
+	};
 
 	/** Gate preconditions: plan mode, enabled, key present, ask budget left. */
 	const gateEligible = (entries: EntryView[]): boolean => {
-		const gcfg = getConfig().ambiguityGate;
-		if (!gcfg.enabled || !apiKeyPresent()) return false;
+		if (!gateEnabled() || !apiKeyPresent()) return false;
 		if (!planModeActive(entries)) return false;
-		return asksObserved() < gcfg.maxAsksPerPlan;
+		return asksObserved() < getConfig().ambiguityGate.maxAsksPerPlan;
 	};
 
-	/** One scored gate evaluation; never throws, returns null when it could not score. */
-	const runGate = async (ctx: GateCtxLike, entries: EntryView[], trigger: GateTrigger, task: string): Promise<AmbiguityResult | null> => {
+	/**
+	 * The plan's objective: its first prompt, never a later follow-up such as "B". Once found it is kept, so a
+	 * prompt that came before the plan marker (--plan-yolo) is not replaced by a later short reply.
+	 */
+	const planTask = (entries: EntryView[]): string => {
+		if (planPrompt === "") planPrompt = firstUserTextFrom(entries, planStart) || lastUserText(entries, 4000, redactOn());
+		return planPrompt;
+	};
+
+	/** The repo outline is stable within a plan, so it is listed once per plan. */
+	const outlineFor = async (ctx: HostContext, signal: AbortSignal): Promise<string> => {
+		if (planOutline !== null) return planOutline;
+		const outline = await repoOutline(pi, ctx.cwd, { signal });
+		if (outline) planOutline = outline;
+		return outline;
+	};
+
+	/**
+	 * One scored gate evaluation; never throws, returns null when it could not score. It reads `git status`
+	 * only (the outline and status run in parallel) and gives up after a deadline well below omp's
+	 * fail-closed tool_call timeout, so a slow git or Jev can never hold up or block a plan write.
+	 */
+	const runGate = async (ctx: HostContext, entries: EntryView[], trigger: GateTrigger, task: string, opts: GateRunOptions = {}): Promise<AmbiguityResult | null> => {
 		const gcfg = getConfig().ambiguityGate;
+		const redact = getConfig().adversary.redact;
 		try {
-			const asked = getAsks();
-			const outline = await repoOutline(pi, ctx.cwd);
-			const evidence = await collectEvidence(pi, ctx.cwd);
-			const result = await scoreAmbiguity(pi, {
-				task: cap(task, 4000),
-				plan_so_far: planSoFar(entries),
-				questions_already_asked: asked.map((a) => a.question),
-				answers_received: asked.map((a) => a.answer),
-				evidence: { status: evidence.status ?? "", repo_outline: outline },
-			}, gcfg);
-			return result;
+			return await withDeadline(async (signal) => {
+				const asked = getAsks();
+				const typed = getUserReplies();
+				const [outline, status] = await Promise.all([
+					outlineFor(ctx, signal),
+					opts.status !== undefined ? opts.status : collectStatus(pi, ctx.cwd, { signal, redact }).then((s) => s.status ?? ""),
+				]);
+				const state = sanitizeState({
+					task: maskedCap(task, 4000, redact),
+					plan_so_far: withProposed(planSoFar(entries, 6000, undefined, redact), opts.proposed),
+					questions_already_asked: asked.map((a) => a.question),
+					answers_received: asked.map((a) => a.answer),
+					...(typed.length > 0 ? { user_replies: typed } : {}),
+					evidence: { status, repo_outline: outline },
+				});
+				return scoreAmbiguity(pi, state as unknown as Parameters<typeof scoreAmbiguity>[1], gcfg, { trigger });
+			}, Math.min(GATE_DEADLINE_CAP_MS, gcfg.timeoutMs + GATE_SLACK_MS));
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity scoring failed (${trigger}): ${describeError(err)}`);
 			return null;
@@ -306,148 +659,211 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			gap: result.gap,
 			userCanAnswer: result.userCanAnswer,
 			decision,
+			question: result.question,
 		});
 	};
 
-	/** Score and, when the task is still too ambiguous, steer the model to ask. */
-	const steerIfAmbiguous = async (ctx: GateCtxLike, entries: EntryView[], trigger: GateTrigger, task: string): Promise<void> => {
+	/**
+	 * Score and, when the task is still too ambiguous and an `ask` tool exists, steer the model to ask.
+	 * With `asReturn` the note is returned for before_agent_start to put into the request being started.
+	 */
+	const steerIfAmbiguous = async (ctx: HostContext, entries: EntryView[], trigger: GateTrigger, task: string, opts: SteerOptions = {}): Promise<{ message: HostMessage } | undefined> => {
 		try {
 			if (!gateEligible(entries)) return;
 			const gcfg = getConfig().ambiguityGate;
-			const result = await runGate(ctx, entries, trigger, task);
+			const result = await runGate(ctx, entries, trigger, task, { status: opts.status });
 			if (!result) return;
-			if (result.ambiguity <= gcfg.threshold || result.userCanAnswer < gcfg.userCanAnswerFloor) {
-				noteScore(trigger, result, "none");
-				return;
+			planStartScored = true;
+			const askAvailable = askToolActive(ctx);
+			let decision = steerDecision(result, gcfg, { askAvailable, immune: isSteerImmune() });
+			let out: { message: HostMessage } | undefined;
+			if (decision === "steer") {
+				const message: HostMessage = {
+					customType: GATE_CUSTOM_TYPE,
+					content: buildGateNote(result, gcfg.threshold, askAvailable),
+					display: true,
+					attribution: "agent",
+				};
+				if (opts.asReturn) out = { message };
+				else if (!send(message, { deliverAs: "aside" })) decision = "would_steer";
+				// Only a steer that went out silences the dimension; a failed send may be retried next turn.
+				if (decision === "steer") markSteered(result.weakest);
 			}
-			// Emission guard: one steer per weakest dimension, and nothing during a steer's immune window.
-			if (isSteerImmune() || !shouldEmit(`gate|${result.weakest}`, 1)) {
-				noteScore(trigger, result, "none");
-				return;
-			}
-			await pi.sendMessage(
-				{ customType: GATE_CUSTOM_TYPE, content: buildGateNote(result, gcfg.threshold), display: true, attribution: "agent" },
-				{ deliverAs: "aside" },
-			);
-			noteScore(trigger, result, "steer");
+			noteScore(trigger, result, decision);
+			return out;
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity gate failed (${trigger}): ${describeError(err)}`);
 		}
 	};
 
-	pi.on("before_agent_start", async (event, ctx) => {
+	on("before_agent_start", async (event, ctx) => {
 		try {
-			const prompt = isRecord(event) && typeof event.prompt === "string" ? event.prompt : "";
-			if (prompt.trim().length > 0) planPrompt = prompt;
-			const entries = scanBranch(ctx.sessionManager.getBranch());
-			if (!planModeActive(entries) || planStartScored) return;
-			planStartScored = true;
-			await steerIfAmbiguous(ctx as GateCtxLike, entries, "plan_start", planPrompt || lastUserText(entries));
+			const entries = branchEntries(ctx);
+			if (!planModeActive(entries)) return;
+			// The first prompt of a plan is its objective; later prompts are answers, not a new task.
+			if (planPrompt === "") {
+				const prompt = isRecord(event) && typeof event.prompt === "string" ? event.prompt.trim() : "";
+				const persisted = firstUserTextFrom(entries, planStart);
+				planPrompt = persisted || maskedCap(prompt, 4000, redactOn());
+				planPromptAwaitingEcho = persisted === "" && planPrompt !== "";
+			} else {
+				// A later prompt is a reply; a flag left over from a first prompt that never reached its message_end must not swallow it.
+				planPromptAwaitingEcho = false;
+			}
+			if (planStartScored || planPrompt === "") return;
+			return await steerIfAmbiguous(ctx, entries, "plan_start", planPrompt, { asReturn: true });
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity plan_start failed: ${describeError(err)}`);
 		}
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
+	on("tool_call", async (event, ctx) => {
 		try {
 			if (!isRecord(event)) return;
 			const toolName = typeof event.toolName === "string" ? event.toolName : "";
 			if (toolName !== "write" || !isProposeWrite(event.input)) return;
-			const entries = scanBranch(ctx.sessionManager.getBranch());
+			const entries = branchEntries(ctx);
 			const gcfg = getConfig().ambiguityGate;
-			if (!gcfg.enabled || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries)) return;
+			if (!gateEnabled() || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries)) return;
 			// Once the ask budget for this plan is spent, stop gating rather than looping.
 			if (asksObserved() >= gcfg.maxAsksPerPlan) return;
-			const result = await runGate(ctx as GateCtxLike, entries, "propose", planPrompt || lastUserText(entries));
+			const proposed = isRecord(event.input) && typeof event.input.content === "string" ? event.input.content : undefined;
+			const result = await runGate(ctx, entries, "propose", planTask(entries), { proposed });
 			if (!result) return;
-			const decision = proposeDecision(result, gcfg, ctx?.hasUI === true);
+			const askAvailable = askToolActive(ctx);
+			const decision = proposeDecision(result, gcfg, ctx?.hasUI === true, { askAvailable });
 			noteScore("propose", result, decision);
 			if (decision !== "block") return;
-			return { block: true, reason: buildBlockReason(result, gcfg.threshold) };
+			noteProposeBlock();
+			return { block: true, reason: buildBlockReason(result, gcfg.threshold, askAvailable) };
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity propose gate failed: ${describeError(err)}`);
 		}
 	});
 
-	pi.on("turn_end", async (_event, ctx) => {
+	on("turn_end", async (event, ctx) => {
 		try {
 			const cfg = getConfig().adversary;
-			const entries = scanBranch(ctx.sessionManager.getBranch());
+			const entries = branchEntries(ctx);
 			const deltaEntries = entries.slice(Math.max(0, Math.min(turnCursor, entries.length)));
 			turnCursor = entries.length;
+			// An aborted or failed model call, or a tool batch the user stopped, must not wake the agent with a note or a question.
+			if (isRecord(event) && (endedAbnormally(event.message) || interruptedBatch(event.toolResults))) return;
+			let reviewEvidence: Evidence | undefined;
 			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries)) {
-				const delta = renderDelta(deltaEntries, 6000);
+				const delta = renderDelta(deltaEntries, 6000, redactOn());
 				if (delta.trim().length > 0) {
-					const evidence = cfg.evidence ? await collectEvidence(pi, ctx.cwd) : undefined;
-					const state: Record<string, unknown> = { task: lastUserText(entries), review_priorities: priorities, delta };
-					if (evidence) state.evidence = evidence;
-					await review(pi, "turn", state, ctx, { evidence }, resolvedRole());
+					// No git probes for a review the call budget would suppress anyway.
+					reviewEvidence = cfg.evidence && hasCallBudget() ? await collectEvidence(pi, ctx.cwd, evidenceOptions()) : undefined;
+					const state: Record<string, unknown> = { task: lastUserText(entries, 1200, redactOn()), review_priorities: priorities, delta };
+					if (reviewEvidence) state.evidence = reviewEvidence;
+					await review(pi, "turn", sanitizeState(state), ctx, { evidence: reviewEvidence }, resolvedRole());
 				}
 			}
-			await steerIfAmbiguous(ctx as GateCtxLike, entries, "turn_end", planPrompt || lastUserText(entries));
+			// The gate only needs `git status`, which the turn review already collected. Under --plan-yolo
+			// nothing marks the start of the plan, so its first evaluation stands in for plan_start.
+			await steerIfAmbiguous(ctx, entries, planStartScored ? "turn_end" : "plan_start", planTask(entries), { status: reviewEvidence?.status });
 		} catch (err) {
 			logger?.warn?.(`[typesafe] turn_end review failed: ${describeError(err)}`);
 		} finally {
+			// The prompt's own message was delivered before the first model call ended; any user message after is a reply.
+			planPromptAwaitingEcho = false;
 			endTurn();
 		}
 	});
 
-	pi.on("message_end", async (event, ctx) => {
+	/** A user message in plan mode: the plan's objective if none is set yet, otherwise an answer to the gate's question. */
+	const noteUserMessage = (raw: Record<string, unknown>, ctx: { sessionManager: { getBranch(): unknown } }): void => {
+		const entries = branchEntries(ctx);
+		if (!planModeActive(entries)) return;
+		const text = textFromContent(raw.content, 4000, redactOn()).trim();
+		if (text.length === 0) return;
+		if (planPrompt === "") planPrompt = text;
+		// The user message that carries the plan's own prompt is not an answer. omp builds event.prompt by joining a
+		// message's text blocks with "" and the branch joins them with "\n", so the two texts cannot be compared: the
+		// first user message after before_agent_start captured the prompt is that prompt.
+		else if (planPromptAwaitingEcho) planPromptAwaitingEcho = false;
+		else recordFollowUp(text);
+	};
+
+	on("message_end", async (event, ctx) => {
 		try {
+			const raw = isRecord(event) && "message" in event ? event.message : event;
+			if (!isRecord(raw)) return;
+			// Only real user messages count: omp's synthetic prompts carry the developer role.
+			if (raw.role === "user") {
+				noteUserMessage(raw, ctx);
+				return;
+			}
+			if (raw.role !== "assistant" || endedAbnormally(raw)) return;
 			const cfg = getConfig().adversary;
 			if (!reviewEnabled() || !cfg.reviewMessages || !apiKeyPresent() || !canReviewMessage()) return;
-			const raw = isRecord(event) && "message" in event ? event.message : event;
-			if (!isRecord(raw) || raw.role !== "assistant") return;
-			const text = textFromContent(raw.content, 4000);
+			const text = textFromContent(raw.content, 4000, redactOn());
 			if (text.length < cfg.minMessageChars) return;
-			const entries = scanBranch(ctx.sessionManager.getBranch());
+			const entries = branchEntries(ctx);
 			if (!phaseAllowed(entries)) return;
 			recordMessageReviewed();
 			const state: Record<string, unknown> = {
-				task: lastUserText(entries),
+				task: lastUserText(entries, 1200, redactOn()),
 				review_priorities: priorities,
 				assistant_message: text,
-				recent_actions: priorActions(entries, 5),
+				recent_actions: priorActions(entries, 5, redactOn()),
 			};
-			await review(pi, "message", state, ctx, {}, resolvedRole());
+			await review(pi, "message", sanitizeState(state), ctx, {}, resolvedRole());
 		} catch (err) {
 			logger?.warn?.(`[typesafe] message_end review failed: ${describeError(err)}`);
 		}
 	});
 
-	pi.on("tool_result", async (event, ctx) => {
+	on("tool_result", async (event, ctx) => {
 		try {
 			if (!isRecord(event)) return;
 			const toolName = typeof event.toolName === "string" ? event.toolName : "";
 			const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
 			if (toolName === "ask") {
-				// Track answered questions so later ambiguity scores see them; no Jev call.
-				recordAsk(stringifyInput(event.input, 400), textFromContent(event.content, 400));
+				// Answered questions count against this plan's ask budget (cancelled and invalid asks do not).
+				if (planModeActive(branchEntries(ctx))) recordAskResult(event.input, event.content, event.isError === true, event.details);
 				return;
 			}
+			if (toolCallId) {
+				if (reviewedCallIds.has(toolCallId)) return;
+				reviewedCallIds.add(toolCallId);
+			}
+			const failed = event.isError === true;
+			// Recorded before every review gate, so a failing or unreviewed `bun test` is still known to the reviewer.
+			recordAction(toolName, { command: commandText(event.input), isError: failed, redact: redactOn() });
 			const cfg = getConfig().adversary;
 			if (!reviewEnabled() || !cfg.reviewActions || !apiKeyPresent()) return;
 			if (toolName === "typesafe_ask" || !toolCallId) return;
 			if (!cfg.tools.includes(toolName)) return;
-			if (event.isError === true) return;
-			if (reviewedCallIds.has(toolCallId)) return;
-			reviewedCallIds.add(toolCallId);
-			recordAction(toolName);
-			const content = Array.isArray(event.content) ? event.content : [];
-			const entries = scanBranch(ctx.sessionManager.getBranch());
+			// A failed edit changed nothing; a failed shell command may already have discarded work.
+			if (failed && !REVIEW_WHEN_FAILED.has(toolName)) return;
+			const content: HostContentBlock[] = Array.isArray(event.content) ? (event.content as HostContentBlock[]) : [];
+			// Not a command that ran and failed (the user stopped it, omp blocked it): nothing to judge, and a late note
+			// must not restart the run.
+			if (failed && !ranAndFailed(toolName, event.details)) return;
+			const resultText = textFromContent(content, 2000, redactOn());
+			const entries = branchEntries(ctx);
 			if (!phaseAllowed(entries)) return;
-			const evidence = cfg.evidence ? await collectEvidence(pi, ctx.cwd) : undefined;
+			// Skip the git probes when the call budget would suppress the review anyway.
+			const evidence =
+				cfg.evidence && hasCallBudget()
+					? await collectEvidence(pi, ctx.cwd, evidenceOptions(EDIT_TOOLS.has(toolName) ? editedPaths(event.input) : undefined))
+					: undefined;
 			const state: Record<string, unknown> = {
-				task: lastUserText(entries),
+				task: lastUserText(entries, 1200, redactOn()),
 				review_priorities: priorities,
-				action: { tool: toolName, input: stringifyInput(event.input, 3000) },
-				result: textFromContent(content, 2000),
-				claimed_intent: claimedIntent(entries, 800),
-				prior_actions: priorActions(entries, 3),
+				// Masked before it is stringified and cut: JSON escaping would hide quoted secrets, and a cut could split one.
+				action: { tool: toolName, input: stringifyInput(sanitizeValue(event.input, redactOn(), { maxString: TOOL_INPUT_CAP * 4 }), TOOL_INPUT_CAP) },
+				result: resultText,
+				exit_status: failed ? "error" : "ok",
+				claimed_intent: claimedIntent(entries, 800, redactOn()),
+				prior_actions: priorActions(entries, 3, redactOn()),
 			};
 			if (evidence) state.evidence = evidence;
-			const outcome = await review(pi, "action", state, ctx, { toolCallId, evidence }, resolvedRole());
-			if (cfg.inlineActionNotes && outcome.note && outcome.decision === "delivered") {
+			const outcome = await review(pi, "action", sanitizeState(state), ctx, { toolCallId, evidence, inline: cfg.inlineActionNotes }, resolvedRole());
+			// The reviewer skipped sendMessage for this note, so the tool result is its only delivery.
+			if (outcome.decision === "delivered_inline" && outcome.note) {
 				// content is a full replacement — spread the original array back in.
 				return { content: [...content, { type: "text", text: `\n${outcome.note}` }] };
 			}
@@ -456,11 +872,15 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_stop", async (_event, ctx) => {
+	on("session_stop", async (event, ctx) => {
 		const gate = getConfig().stopGate;
-		if (!gate.enabled || stopGateUses >= 2 || !apiKeyPresent()) return;
+		if (!gate.enabled || stopGateUses >= 2 || !apiKeyPresent() || !reviewEnabled()) return;
+		// The host sets stop_hook_active when this very gate's continuation is what stopped; never chain another.
+		if (isRecord(event) && event.stop_hook_active === true) return;
 		try {
 			const entries = scanBranch(ctx.sessionManager.getBranch());
+			// "Finish the remaining work" would push a planning agent toward implementing.
+			if (planModeActive(entries) || !getConfig().phases.includes("execute")) return;
 			const questions: Questions = {
 				verified: noul("The assistant ran a command, test, or check demonstrating the change works.", {
 					true: "A command, test, or check demonstrated the change works.",
@@ -471,12 +891,13 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 					false: "Everything claimed complete is implemented.",
 				}),
 			};
-			const state: Record<string, unknown> = {
-				task: lastUserText(entries),
+			const lastMessage = isRecord(event) ? lastMessageText(event.last_assistant_message) : "";
+			const state = sanitizeState({
+				task: lastUserText(entries, 1200, redactOn()),
 				review_priorities: priorities,
-				final_assistant_message: claimedIntent(entries, 2000),
-			};
-			const { result } = await ask(state, questions, { timeoutMs: 4000, maxRetries: 0 });
+				final_assistant_message: lastMessage ? maskedCap(lastMessage, 2000, redactOn()) : claimedIntent(entries, 2000, redactOn()),
+			});
+			const { result } = await ask(state as unknown as Parameters<typeof ask>[0], questions, { timeoutMs: 4000, maxRetries: 0 });
 			const verified = answerNumber(result.answers.verified, "noul") ?? 1;
 			const leftUnfinished = answerNumber(result.answers.left_unfinished, "noul") ?? 0;
 			const problems: string[] = [];
@@ -493,20 +914,35 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	on("session_shutdown", async () => {
 		const path = process.env.TYPESAFE_BENCH_LOG;
 		if (!path) return;
 		try {
 			const cfg = getConfig();
+			const stats = getReviewStats();
 			const payload = {
-				role: cfg.role,
+				// Effective values: session overrides (/adversary role|on|off|gate) applied.
+				role: resolvedRole(),
 				phases: cfg.phases,
-				stats: getReviewStats(),
+				stats,
 				usage: getSessionUsage(),
 				costUsd: estimateCostUsd(),
 				lastResolvedModel: getLastResolvedModel(),
 				history: getReviewHistory(),
+				historyDropped: stats.historyDropped,
+				config: {
+					role: resolvedRole(),
+					phases: cfg.phases,
+					model: cfg.model,
+					adversaryEnabled: reviewEnabled(),
+					reviewActions: cfg.adversary.reviewActions,
+					reviewMessages: cfg.adversary.reviewMessages,
+					reviewTurns: cfg.adversary.reviewTurns,
+					ambiguityGateEnabled: gateEnabled(),
+				},
 				ambiguity: getAmbiguityTelemetry(),
+				// Subagent sessions whose hooks were skipped: a bench cell that spawns workers shows it here.
+				subagentSessionsSkipped: getSubagentStats().sessions,
 			};
 			await Bun.write(path, JSON.stringify(payload, null, 2));
 		} catch (err) {
@@ -514,7 +950,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		}
 	});
 
-	let optionsSchema: ZodSchemaLike;
+	let optionsSchema: ZodSchema;
 	if (typeof z?.record === "function") {
 		optionsSchema = z.record(z.string());
 	} else {
@@ -542,7 +978,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			),
 			model: z.string().optional(),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId: string, params: AskToolParams, signal?: AbortSignal) {
 			try {
 				let state: unknown = params.state;
 				if (params.stateFormat === "json") {
@@ -559,7 +995,17 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				if (!apiKeyPresent()) {
 					return { content: [{ type: "text", text: "typesafe_ask: TYPESAFE_API_KEY is not set" }], isError: true };
 				}
-				const { result, requestId } = await ask(state, built.questions, { timeoutMs: 10000, maxRetries: 2, model: params.model });
+				// What the model wrote into the question (instructions, option and rubric text) leaves like the state does. The
+				// question ids and option names are keys here, and not secret-named keys: they are masked by pattern, never whole.
+				const redact = redactOn();
+				const questions = sanitizeValue(built.questions, redact, { keyAware: false }) as Questions;
+				// The model override goes in this request only; the signal lets Esc stop the call.
+				const { result, requestId } = await ask(sanitizeValue(state, redact) as Parameters<typeof ask>[0], questions, {
+					timeoutMs: 10000,
+					maxRetries: 2,
+					model: params.model,
+					signal,
+				});
 				return {
 					content: [{ type: "text", text: summarizeAnswers(result.answers) }],
 					details: { model: result.model, answers: result.answers, usage: result.usage, requestId },
@@ -571,7 +1017,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("adversary", {
-		description: "TypeSafe adversary reviewer: toggle | on | off | status | last | dump | role",
+		description: "TypeSafe adversary reviewer: toggle | on | off | status | last | dump | role | gate",
 		handler: async (args, ctx) => {
 			const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter((t) => t.length > 0) : [];
 			const sub = tokens[0] ?? "";
@@ -582,12 +1028,22 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			} else if (sub === "on" || sub === "off") {
 				sessionOverride = sub === "on";
 				notifyVia(ctx, logger, `TypeSafe adversary ${sub} for this session`);
+			} else if (sub === "gate") {
+				const value = tokens[1];
+				if (value !== "on" && value !== "off") {
+					notifyVia(ctx, logger, "usage: /adversary gate on|off", "warning");
+				} else {
+					sessionGateOverride = value === "on";
+					notifyVia(ctx, logger, `TypeSafe ambiguity gate ${value} for this session`);
+				}
 			} else if (sub === "role") {
 				const value = tokens[1];
 				if (value !== "advisory" && value !== "adversarial") {
-					notifyVia(ctx, logger, "usage: /adversary role advisory|adversarial", "warn");
+					notifyVia(ctx, logger, "usage: /adversary role advisory|adversarial", "warning");
 				} else {
 					sessionRoleOverride = value;
+					// Each role has its own priorities file (ADVERSARY.md / WATCHDOG.md).
+					await reloadPriorities(ctx?.cwd, value);
 					pi.setLabel(roleLabel(value));
 					notifyVia(ctx, logger, `TypeSafe role set to ${value} for this session`);
 				}
@@ -595,35 +1051,46 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				const stats = getReviewStats();
 				const usage = getSessionUsage();
 				const resolved = getLastResolvedModel();
+				const clientError = getClientError();
+				const warnings = getConfigWarnings();
+				const subagents = getSubagentStats();
 				const suppressed = Object.entries(stats.suppressed)
 					.map(([reason, count]) => `${reason}=${count}`)
 					.join(" ");
 				const lines = [
 					`adversary: ${reviewEnabled() ? "enabled" : "disabled"}${sessionOverride !== null ? ` (session override: ${sessionOverride ? "on" : "off"})` : ""}`,
 					`role: ${resolvedRole()}${sessionRoleOverride !== null ? ` (session override: ${sessionRoleOverride})` : ""}; phases: ${cfg.phases.join(",")}`,
+					`tools: ${cfg.adversary.tools.length > 0 ? cfg.adversary.tools.join(",") : "none"}`,
 					`model: ${cfg.model}${resolved ? ` (last resolved: ${resolved})` : ""}`,
-					`api key: ${apiKeyPresent() ? "present" : "MISSING"}`,
+					`api key: ${apiKeyPresent() ? "present" : "MISSING"}${clientError ? `; client error: ${clientError}` : ""}`,
 					`notes delivered: nit=${stats.delivered.nit} concern=${stats.delivered.concern} blocker=${stats.delivered.blocker}; downgraded=${stats.downgraded}; steers=${stats.steers}`,
 					`suppressed: ${suppressed || "none"}; errors=${stats.errors}`,
 					`usage: ${usage.requests} requests, ${usage.inputTokens} in / ${usage.outputTokens} out tokens, ~$${estimateCostUsd().toFixed(6)}`,
 					(() => {
 						const last = getLastAmbiguityScore();
 						const g = cfg.ambiguityGate;
-						if (!last) return `ambiguity gate: ${g.enabled ? "enabled" : "disabled"} (threshold ${fmt2(g.threshold)}); no score yet; asks observed=${asksObserved()}`;
-						return `ambiguity gate: ${g.enabled ? "enabled" : "disabled"} (threshold ${fmt2(g.threshold)}); last ${fmt2(last.ambiguity)} trigger=${last.trigger} weakest=${last.weakest} gap=${last.gap} decision=${last.decision}; asks observed=${asksObserved()}`;
+						const state = `${gateEnabled() ? "enabled" : "disabled"}${sessionGateOverride !== null ? ` (session override: ${sessionGateOverride ? "on" : "off"})` : ""}`;
+						if (!last) return `ambiguity gate: ${state} (threshold ${fmt2(g.threshold)}); no score yet; asks observed=${asksObserved()}`;
+						return `ambiguity gate: ${state} (threshold ${fmt2(g.threshold)}); last ${fmt2(last.ambiguity)} trigger=${last.trigger} weakest=${last.weakest} gap=${last.gap} decision=${last.decision}; asks observed=${asksObserved()}`;
 					})(),
+					`subagent guard: ${subagentGuardEnabled() ? "on" : "off (TYPESAFE_SUBAGENT_GUARD)"}; subagent sessions skipped=${subagents.sessions} (hook calls skipped=${subagents.hookCalls})`,
 				];
+				if (warnings.length > 0) lines.push(`config warnings: ${warnings.join(" | ")}`);
 				notifyVia(ctx, logger, lines.join("\n"));
 			} else if (sub === "last") {
 				const record = getLastReviewRecord();
 				notifyVia(ctx, logger, record ? JSON.stringify(record, null, 2) : "no reviews yet");
 			} else if (sub === "dump") {
-				const sessionId = ctx?.sessionManager?.getSessionId?.() ?? "unknown";
-				const path = `${homedir()}/.omp/logs/adversary-${sessionId}.json`;
-				await Bun.write(path, JSON.stringify(getReviewHistory(), null, 2));
-				notifyVia(ctx, logger, `adversary history written to ${path}`);
+				const sessionId = safeFileId(ctx?.sessionManager?.getSessionId?.());
+				const path = join(dumpDir(), `adversary-${sessionId}.json`);
+				try {
+					await Bun.write(path, JSON.stringify(getReviewHistory(), null, 2));
+					notifyVia(ctx, logger, `adversary history written to ${path}`);
+				} catch (err) {
+					notifyVia(ctx, logger, `dump failed: ${describeError(err)}`, "error");
+				}
 			} else {
-				notifyVia(ctx, logger, "usage: /adversary [on|off|status|last|dump|role advisory|adversarial] (bare command toggles)", "warn");
+				notifyVia(ctx, logger, "usage: /adversary [on|off|status|last|dump|role advisory|adversarial|gate on|off] (bare command toggles)", "warning");
 			}
 		},
 	});
@@ -633,16 +1100,16 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = typeof args === "string" ? args.trim().split(/\s+/)[0] || "test" : "test";
 			if (sub !== "test") {
-				notifyVia(ctx, logger, "usage: /typesafe test", "warn");
+				notifyVia(ctx, logger, "usage: /typesafe test", "warning");
 				return;
 			}
 			if (!apiKeyPresent()) {
-				notifyVia(ctx, logger, "TYPESAFE_API_KEY is not set", "warn");
+				notifyVia(ctx, logger, "TYPESAFE_API_KEY is not set", "warning");
 				return;
 			}
 			const started = Date.now();
 			try {
-				const { result } = await ask({ probe: "hello world", note: "typesafe test command" }, { greeting: noul("Is this a greeting?") }, { timeoutMs: 10000, maxRetries: 2 });
+				const { result } = await ask({ probe: "hello world", note: "typesafe test command" }, { greeting: noul("Is this a greeting?") }, { timeoutMs: PROBE_TIMEOUT_MS, maxRetries: 1, budgetMs: PROBE_BUDGET_MS });
 				const ms = Date.now() - started;
 				const greeting = result.answers.greeting;
 				notifyVia(ctx, logger, `noul=${typeof greeting?.noul === "number" ? greeting.noul.toFixed(3) : "?"} model=${result.model} latency=${ms}ms usage in=${result.usage?.input_tokens ?? 0} out=${result.usage?.output_tokens ?? 0}`);

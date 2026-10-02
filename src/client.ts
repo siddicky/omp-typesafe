@@ -10,7 +10,8 @@ import {
 	noul,
 	score,
 } from "@typesafe-ai/sdk";
-import type { EntryType, Questions } from "@typesafe-ai/sdk";
+import type { EntryType, Logger, Questions } from "@typesafe-ai/sdk";
+import { getConfig } from "./config";
 
 /**
  * SDK wrapper. All TypeSafe traffic goes through here so usage tracking,
@@ -18,6 +19,34 @@ import type { EntryType, Questions } from "@typesafe-ai/sdk";
  */
 
 let client: TypeSafeClient | null = null;
+/** Configured model the cached client was built with; a config reload that changes it rebuilds the client. */
+let clientModel: string | null = null;
+let clientError: string | null = null;
+
+/** omp's extension logger: every method optional, extra args passed through. */
+export interface ClientLogger {
+	debug?(message: string, ...args: unknown[]): void;
+	info?(message: string, ...args: unknown[]): void;
+	warn?(message: string, ...args: unknown[]): void;
+	error?(message: string, ...args: unknown[]): void;
+}
+
+let sdkLogger: ClientLogger | undefined;
+
+/**
+ * Send SDK log output to omp's logger instead of the console, which is the omp TUI. Late-bound, so it
+ * takes effect for an already cached client.
+ */
+export function setClientLogger(logger: ClientLogger | undefined): void {
+	sdkLogger = logger;
+}
+
+const routedLogger: Logger = {
+	debug: (message, ...args) => sdkLogger?.debug?.(`[typesafe sdk] ${message}`, ...args),
+	info: (message, ...args) => sdkLogger?.info?.(`[typesafe sdk] ${message}`, ...args),
+	warn: (message, ...args) => sdkLogger?.warn?.(`[typesafe sdk] ${message}`, ...args),
+	error: (message, ...args) => sdkLogger?.error?.(`[typesafe sdk] ${message}`, ...args),
+};
 
 export interface SessionUsage {
 	inputTokens: number;
@@ -35,15 +64,37 @@ export function apiKeyPresent(): boolean {
 	return !!process.env.TYPESAFE_API_KEY?.trim();
 }
 
-export function getClient(model?: string): TypeSafeClient {
-	if (!client) {
-		client = new TypeSafeClient(model ? { defaultModel: model } : {});
+/**
+ * The shared client, built with the configured model as its default. A per-call model override never
+ * reaches the cache (ask() puts it in the request body), so one bad override cannot poison later
+ * calls. `logLevel` is pinned: left to the SDK it would follow TYPESAFE_LOG_LEVEL, where "debug" dumps
+ * every request body (task text, diffs) into the terminal and an invalid value makes this throw.
+ */
+export function getClient(): TypeSafeClient {
+	const model = getConfig().model;
+	if (client && clientModel === model) return client;
+	try {
+		client = new TypeSafeClient({ defaultModel: model, logLevel: "warn", logger: routedLogger });
+		clientModel = model;
+		clientError = null;
+	} catch (err) {
+		client = null;
+		clientModel = null;
+		clientError = describeError(err);
+		throw err;
 	}
 	return client;
 }
 
+/** Why the last attempt to construct the SDK client failed, or null; for /adversary status. */
+export function getClientError(): string | null {
+	return clientError;
+}
+
 export function resetClient(): void {
 	client = null;
+	clientModel = null;
+	clientError = null;
 	lastResolvedModel = null;
 }
 
@@ -69,8 +120,45 @@ export interface AskOptions {
 	/** Per-attempt timeout in ms. SDK default is 10000. */
 	timeoutMs?: number;
 	maxRetries?: number;
-	/** Model override; usually omitted so the client default applies. */
+	/** Model override for this request only (sent in the body); omitted means the configured model. */
 	model?: string;
+	/** Hard cap in ms on the whole call including retries. Defaults to retryBudgetMs(). */
+	budgetMs?: number;
+	/** Caller cancellation, e.g. the tool call's abort signal; surfaces as APIUserAbortError ("aborted"). */
+	signal?: AbortSignal;
+}
+
+/** Longest single wait between attempts: a Retry-After up to this is honored, a longer one ends the call. */
+const MAX_RETRY_WAIT_MS = 5_000;
+const BUDGET_SLACK_MS = 300;
+/** Wait before the first retry of a 429 that names no Retry-After; doubled for each further one. */
+const RATE_LIMIT_BACKOFF_MS = 500;
+/**
+ * The statuses the SDK retries by default (408 and 5xx) without 429. The SDK would answer a 429 whose Retry-After is
+ * longer than maxRetryAfterMs with its own short backoff, hammering a rate-limited endpoint; ask() handles it instead.
+ */
+const SDK_RETRY_STATUSES: ReadonlySet<number> = new Set([408, ...Array.from({ length: 100 }, (_, i) => 500 + i)]);
+
+/** Wait `ms`, ending early with APIUserAbortError when `signal` aborts, the way the SDK's own retry wait does. */
+function waitUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const abort = () => {
+			clearTimeout(timer);
+			reject(new APIUserAbortError(undefined, { cause: signal.reason }));
+		};
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", abort);
+			resolve();
+		}, ms);
+		if (signal.aborted) abort();
+		else signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
+/** Worst case for one call: every attempt times out and every retry waits the maximum. */
+export function retryBudgetMs(timeoutMs: number, maxRetries: number): number {
+	const retries = Math.max(0, Math.trunc(maxRetries));
+	return timeoutMs * (retries + 1) + retries * MAX_RETRY_WAIT_MS + BUDGET_SLACK_MS;
 }
 
 export interface WireAnswer {
@@ -89,7 +177,8 @@ export interface AskResult {
 
 /**
  * One systemOne call. `state` may be a string, object, or array.
- * Timeouts are per attempt; `signal` is a belt-and-braces total budget.
+ * Timeouts are per attempt; the whole call, retries included, is bounded by `budgetMs`. A budget
+ * expiry is reported as APITimeoutError, not as the APIUserAbortError the SDK raises for any abort.
  */
 export async function ask(
 	state: EntryType,
@@ -98,34 +187,63 @@ export async function ask(
 ): Promise<AskResult> {
 	const timeoutMs = opts.timeoutMs ?? 10_000;
 	const maxRetries = opts.maxRetries ?? 0;
-	const c = getClient(opts.model);
-	const promise = c.systemOne(
-		{ state, questions, ...(opts.model ? { model: opts.model } : {}) },
-		{
-			timeout: timeoutMs,
-			retry: { maxRetries },
-			signal: AbortSignal.timeout(timeoutMs + 300),
-		},
-	);
-	const wrapped = await promise.withResponse();
-	const data = wrapped.data;
-	usage.inputTokens += data.usage?.input_tokens ?? 0;
-	usage.outputTokens += data.usage?.output_tokens ?? 0;
-	usage.requests += 1;
-	lastResolvedModel = data.model ?? null;
-	const answers: Record<string, WireAnswer> = {};
-	for (const [name, answer] of Object.entries(data.answers)) {
-		// Spread into a fresh object literal so the answer fits the index signature.
-		answers[name] = { ...answer };
+	const budgetMs = opts.budgetMs ?? retryBudgetMs(timeoutMs, maxRetries);
+	const caller = opts.signal;
+	const controller = new AbortController();
+	let budgetExpired = false;
+	const timer = setTimeout(() => {
+		budgetExpired = true;
+		controller.abort();
+	}, budgetMs);
+	const onCallerAbort = () => controller.abort(caller?.reason);
+	if (caller?.aborted) onCallerAbort();
+	else caller?.addEventListener("abort", onCallerAbort, { once: true });
+	try {
+		// A 429 is retried here, not by the SDK: only when it names a wait the caller can afford, within maxRetries.
+		for (let rateLimited = 0; ; rateLimited++) {
+			try {
+				const promise = getClient().systemOne(
+					{ state, questions, ...(opts.model ? { model: opts.model } : {}) },
+					{
+						timeout: timeoutMs,
+						retry: { maxRetries, maxRetryAfterMs: MAX_RETRY_WAIT_MS, httpStatuses: SDK_RETRY_STATUSES },
+						signal: controller.signal,
+					},
+				);
+				const wrapped = await promise.withResponse();
+				const data = wrapped.data;
+				usage.inputTokens += data.usage?.input_tokens ?? 0;
+				usage.outputTokens += data.usage?.output_tokens ?? 0;
+				usage.requests += 1;
+				lastResolvedModel = data.model ?? null;
+				const answers: Record<string, WireAnswer> = {};
+				for (const [name, answer] of Object.entries(data.answers)) {
+					// Spread into a fresh object literal so the answer fits the index signature.
+					answers[name] = { ...answer };
+				}
+				return {
+					result: {
+						model: data.model,
+						answers,
+						usage: { input_tokens: data.usage?.input_tokens ?? 0, output_tokens: data.usage?.output_tokens ?? 0 },
+					},
+					requestId: wrapped.requestId,
+				};
+			} catch (err) {
+				const wait = err instanceof RateLimitError ? (err.retryAfterMs ?? RATE_LIMIT_BACKOFF_MS * 2 ** rateLimited) : Number.POSITIVE_INFINITY;
+				if (rateLimited >= maxRetries || wait > MAX_RETRY_WAIT_MS) throw err;
+				await waitUnlessAborted(wait, controller.signal);
+			}
+		}
+	} catch (err) {
+		if (budgetExpired && !caller?.aborted && err instanceof APIUserAbortError) {
+			throw new APITimeoutError(budgetMs, { cause: err });
+		}
+		throw err;
+	} finally {
+		clearTimeout(timer);
+		caller?.removeEventListener("abort", onCallerAbort);
 	}
-	return {
-		result: {
-			model: data.model,
-			answers,
-			usage: { input_tokens: data.usage?.input_tokens ?? 0, output_tokens: data.usage?.output_tokens ?? 0 },
-		},
-		requestId: wrapped.requestId,
-	};
 }
 
 /** Human-readable classification of an SDK failure. */
