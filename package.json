@@ -1,7 +1,7 @@
 {
   "name": "omp-typesafe",
   "version": "0.1.1",
-  "description": "TypeSafe AI (Jev) adversarial reviewer and typesafe_ask tool for the omp coding agent",
+  "description": "TypeSafe AI (Jev) adversarial and advisory reviewer, ambiguity gate and typesafe_ask tool for the omp coding agent",
   "license": "MIT",
   "author": "Abdullah Siddique",
   "type": "module",
@@ -26,7 +26,19 @@
       "./src/index.ts"
     ]
   },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.3"
+  },
   "dependencies": {
     "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.4.5",
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }
