@@ -186,6 +186,9 @@ const READ_ONLY_TOOLS: Record<string, true> = {
 	skill_search: true,
 	skill_load: true,
 	web_search: true,
+	// Waiting on background work and bookkeeping a checklist make no claim and touch no code.
+	wait: true,
+	todo: true,
 };
 
 /** No new claim or side effect to judge; unrecognized entries and failed results stay eligible. */

@@ -99,8 +99,8 @@ Details that decide whether a review happens:
   review that is already in flight when you press Esc still finishes and may deliver its note, because the host
   gives the extension no abort signal to cancel it with.
 - **Read-only steps without assistant text are skipped.** A turn containing only `read`, `grep`, `glob`, `find`,
-  `skill_search`, `skill_load` or `web_search` calls and their successful results adds no claim or side effect to judge.
-  New assistant text, failed results, other tools and unknown entries still get the usual review.
+  `skill_search`, `skill_load`, `web_search`, `wait` or `todo` calls and their successful results adds no claim or
+  side effect to judge. New assistant text, failed results, other tools and unknown entries still get the usual review.
 - **Phases.** `phases` (`["plan", "execute"]` by default) restricts which omp mode the reviewer is active in.
   Set it to `["execute"]`, for example, to review only outside plan mode.
 

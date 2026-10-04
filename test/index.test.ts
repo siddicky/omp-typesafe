@@ -287,7 +287,7 @@ describe("read-only turn eligibility", () => {
 	test.each(["adversarial", "advisory"])("skips text-free successful read-only steps before paying or probing (%s)", async (role) => {
 		const h = setup({ role }, [userMsg("fix the bug")]);
 		await h.start();
-		for (const [turnIndex, tool] of ["read", "grep", "glob", "find", "skill_search", "skill_load", "web_search"].entries()) {
+		for (const [turnIndex, tool] of ["read", "grep", "glob", "find", "skill_search", "skill_load", "web_search", "wait", "todo"].entries()) {
 			await h.fire("turn_start", { turnIndex });
 			const probes = h.execCalls.length;
 			h.branch.push(call(tool), result(tool));
