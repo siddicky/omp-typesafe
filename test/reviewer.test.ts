@@ -17,16 +17,21 @@ interface QueuedAnswer {
 
 let queuedAnswers: Record<string, QueuedAnswer> = {};
 let apiKeyPresentValue = true;
+let askFailure: Error | undefined;
+let askWait: Promise<void> | undefined;
 const askCalls: { state: unknown; questions: Record<string, { type: string; instructions?: string }> }[] = [];
 
 mock.module("../src/client", () => ({
 	apiKeyPresent: () => apiKeyPresentValue,
 	ask: async (state: unknown, questions: unknown, _opts: unknown) => {
 		askCalls.push({ state, questions: questions as Record<string, { type: string; instructions?: string }> });
+		const answers = queuedAnswers;
+		if (askWait) await askWait;
+		if (askFailure) throw askFailure;
 		return {
 			result: {
 				model: "jev-test",
-				answers: queuedAnswers,
+				answers,
 				usage: { input_tokens: 10, output_tokens: 0 },
 			},
 			requestId: "test-request",
@@ -103,6 +108,8 @@ function idleCtx(isIdle = false) {
 
 beforeEach(() => {
 	queuedAnswers = {};
+	askFailure = undefined;
+	askWait = undefined;
 	apiKeyPresentValue = true;
 	askCalls.length = 0;
 	Object.assign(getConfig().adversary, DEFAULT_CONFIG.adversary);
@@ -360,6 +367,84 @@ function sentOptions(pi: FakePi, index = 0): Record<string, unknown> {
 	return (pi.sent[index]?.options ?? {}) as Record<string, unknown>;
 }
 
+describe("exact review reuse", () => {
+	test("an identical successful review is deduped without another paid call", async () => {
+		const pi = new FakePi();
+		const state = actionState("edit", { path: "a.ts" });
+		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.9 } });
+		await review(pi, "action", state, idleCtx());
+		advanceTurns(1);
+		const again = await review(pi, "action", state, idleCtx());
+		expect(again.reason).toBe("duplicate");
+		expect(askCalls.length).toBe(1);
+		expect(getLastReviewRecord()?.usage.inputTokens).toBe(0);
+	});
+
+	test("concurrent identical reviews share one paid call", async () => {
+		let release!: () => void;
+		askWait = new Promise<void>((resolve) => { release = resolve; });
+		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.9 } });
+		const pi = new FakePi();
+		const state = actionState("edit", { path: "a.ts" });
+		const first = review(pi, "action", state, idleCtx());
+		const second = review(pi, "action", state, idleCtx());
+		release();
+		const outcomes = await Promise.all([first, second]);
+		expect(askCalls.length).toBe(1);
+		expect(outcomes.map((o) => o.decision)).toEqual(["delivered", "suppressed"]);
+	});
+
+	test("changed state is judged again and can escalate a finding", async () => {
+		const pi = new FakePi();
+		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.9 } });
+		await review(pi, "action", actionState("edit", { path: "a.ts" }, { result: "first edit" }), idleCtx());
+		queuedAnswers = answersFor("action", "adversarial", { severity: 2.8, nouls: { breaks_contract: 0.9 } });
+		const escalated = await review(pi, "action", actionState("edit", { path: "a.ts" }, { result: "second edit" }), idleCtx());
+		expect(askCalls.length).toBe(2);
+		expect(escalated.severity).toBe("blocker");
+		expect(escalated.decision).toBe("delivered");
+	});
+
+	test("model, battery, role and evidence changes never reuse a judgment", async () => {
+		const pi = new FakePi();
+		queuedAnswers = answersFor("message", "adversarial", { severity: 0.1 });
+		const state = { task: "t" };
+		await review(pi, "message", state, idleCtx());
+		await review(pi, "turn", state, idleCtx());
+		await review(pi, "message", state, idleCtx(), {}, "advisory");
+		await review(pi, "message", { ...state, evidence: { status: "M a.ts" } }, idleCtx());
+		const model = getConfig().model;
+		try {
+			getConfig().model = "jev-other";
+			await review(pi, "message", state, idleCtx());
+		} finally {
+			getConfig().model = model;
+		}
+		expect(askCalls.length).toBe(5);
+	});
+
+	test("failed requests are not cached", async () => {
+		const pi = new FakePi();
+		askFailure = new Error("transport failed");
+		expect((await review(pi, "message", { task: "t" }, idleCtx())).decision).toBe("error");
+		askFailure = undefined;
+		queuedAnswers = answersFor("message", "adversarial", { severity: 0.1 });
+		expect((await review(pi, "message", { task: "t" }, idleCtx())).decision).toBe("none");
+		expect(askCalls.length).toBe(2);
+	});
+
+	test("a new prompt starts a fresh judgment cache", async () => {
+		queuedAnswers = answersFor("message", "adversarial", { severity: 0.1 });
+		const pi = new FakePi();
+		await review(pi, "message", { task: "t" }, idleCtx());
+		await review(pi, "message", { task: "t" }, idleCtx());
+		expect(askCalls.length).toBe(1);
+		beginPrompt();
+		await review(pi, "message", { task: "t" }, idleCtx());
+		expect(askCalls.length).toBe(2);
+	});
+});
+
 describe("dedupe identity", () => {
 	test("distinct zero-fired blockers on different files are both delivered", async () => {
 		const pi = new FakePi();
@@ -378,7 +463,7 @@ describe("dedupe identity", () => {
 		queuedAnswers = answersFor("action", "adversarial", { severity: 2.8, defect: "data_loss" });
 		await review(pi, "action", actionState("edit", { path: "a.ts" }), idleCtx(), { toolCallId: "1" }, "adversarial");
 		queuedAnswers = answersFor("action", "adversarial", { severity: 2.8, defect: "contract_break" });
-		const b = await review(pi, "action", actionState("edit", { path: "a.ts" }), idleCtx(), { toolCallId: "2" }, "adversarial");
+		const b = await review(pi, "action", actionState("edit", { path: "a.ts" }, { result: "second edit" }), idleCtx(), { toolCallId: "2" }, "adversarial");
 		expect(b.decision).toBe("delivered");
 	});
 
@@ -407,7 +492,7 @@ describe("dedupe identity", () => {
 		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.9 }, defect: "contract_break" });
 		await review(pi, "action", actionState("edit", { path: "a.ts" }), idleCtx(), { toolCallId: "1" }, "adversarial");
 		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.9 }, defect: "missed_callsite" });
-		const again = await review(pi, "action", actionState("edit", { path: "a.ts" }), idleCtx(), { toolCallId: "2" }, "adversarial");
+		const again = await review(pi, "action", actionState("edit", { path: "a.ts" }, { result: "changed evidence" }), idleCtx(), { toolCallId: "2" }, "adversarial");
 		expect(again.reason).toBe("duplicate");
 	});
 
@@ -438,6 +523,7 @@ describe("dedupe identity", () => {
 		queuedAnswers = answersFor("action", "adversarial", { severity: 0.2, nouls: { breaks_contract: 0.6 } });
 		const nit = await review(pi, "action", state, idleCtx(), { toolCallId: "1" }, "adversarial");
 		queuedAnswers = answersFor("action", "adversarial", { severity: 1.6, nouls: { breaks_contract: 0.6 } });
+		state.result = "new evidence of the same finding";
 		const concern = await review(pi, "action", state, idleCtx(), { toolCallId: "2" }, "adversarial");
 		const concernAgain = await review(pi, "action", state, idleCtx(), { toolCallId: "3" }, "adversarial");
 		expect([nit.decision, concern.decision, concernAgain.decision]).toEqual(["delivered", "delivered", "suppressed"]);
@@ -645,7 +731,7 @@ describe("note budget (maxNotesPerUpdate)", () => {
 		const outcomes = [];
 		for (const id of ["unsupported_claim", "requirement_missed", "risky_api"]) {
 			queuedAnswers = answersFor("message", "adversarial", { severity: 1.6, nouls: { [id]: 0.9 } });
-			outcomes.push(await review(pi, "message", { task: "t" }, idleCtx(true), {}, "adversarial"));
+			outcomes.push(await review(pi, "message", { task: "t", assistant_message: id }, idleCtx(true), {}, "adversarial"));
 		}
 		expect(outcomes.map((o) => o.decision)).toEqual(["delivered", "suppressed", "suppressed"]);
 		expect(outcomes[1].reason).toBe("update_budget");
@@ -653,12 +739,12 @@ describe("note budget (maxNotesPerUpdate)", () => {
 		expect(pi.sent.length).toBe(1);
 
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.8, nouls: { weak_verification: 0.9 } });
-		const blocker = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+		const blocker = await review(pi, "message", { task: "t", assistant_message: "weak_verification" }, idleCtx(), {}, "adversarial");
 		expect(blocker.decision).toBe("delivered");
 
 		beginTurn();
 		queuedAnswers = answersFor("message", "adversarial", { severity: 1.6, nouls: { risky_api: 0.9 } });
-		const nextTurn = await review(pi, "message", { task: "t" }, idleCtx(true), {}, "adversarial");
+		const nextTurn = await review(pi, "message", { task: "t", assistant_message: "risky_api" }, idleCtx(true), {}, "adversarial");
 		expect(nextTurn.decision).toBe("delivered");
 	});
 
@@ -864,7 +950,7 @@ describe("delivery channel", () => {
 		const first = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
 		expect(first.channel).toBe("steer");
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.8, nouls: { unsupported_claim: 0.9 } });
-		const afterMessage = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+		const afterMessage = await review(pi, "message", { task: "t", assistant_message: "new claim" }, idleCtx(), {}, "adversarial");
 		queuedAnswers = answersFor("action", "adversarial", { severity: 2.8, nouls: { breaks_contract: 0.9 } });
 		const afterAction = await review(pi, "action", actionState("edit", { path: "a.ts" }), idleCtx(), { toolCallId: "1" }, "adversarial");
 		expect(afterMessage.channel).toBe("nextTurn");
@@ -900,7 +986,7 @@ describe("delivery channel", () => {
 /** One cheap review (nothing fires), to spend a Jev call. */
 async function spendOne(pi = new FakePi()) {
 	queuedAnswers = answersFor("message", "adversarial", { severity: 0.1 });
-	return review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+	return review(pi, "message", { task: `t ${askCalls.length}` }, idleCtx(), {}, "adversarial");
 }
 
 /** Review until the per-turn or per-prompt budget refuses; returns how many Jev calls went through. */
@@ -950,7 +1036,7 @@ describe("budgets", () => {
 		queuedAnswers = answersFor("message", "adversarial", { severity: 0.1 });
 		const pi = new FakePi();
 		await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
-		const second = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+		const second = await review(pi, "message", { task: "different task" }, idleCtx(), {}, "adversarial");
 		expect(second.reason).toBe("call_budget");
 	});
 
@@ -1014,7 +1100,7 @@ describe("steer immunity", () => {
 		advanceTurns(1);
 		expect(isSteerImmune()).toBe(false);
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.8, nouls: { unsupported_claim: 0.9 } });
-		const third = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+		const third = await review(pi, "message", { task: "t", assistant_message: "new claim" }, idleCtx(), {}, "adversarial");
 		expect(third.channel).toBe("steer");
 	});
 
@@ -1042,7 +1128,7 @@ describe("downgraded notes can still escalate", () => {
 	test("a blocker downgraded during immunity steers once after the window ends", async () => {
 		const pi = new FakePi();
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.8, nouls: { risky_api: 0.9 } });
-		await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
+		await review(pi, "message", { task: "t", assistant_message: "first claim" }, idleCtx(), {}, "adversarial");
 
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.8, nouls: { unsupported_claim: 0.9 } });
 		const downgraded = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");

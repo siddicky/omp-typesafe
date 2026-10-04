@@ -98,6 +98,9 @@ Details that decide whether a review happens:
   The limits: an error that omp words in some other way is not recognised as a stop (the turn is reviewed), and a
   review that is already in flight when you press Esc still finishes and may deliver its note, because the host
   gives the extension no abort signal to cancel it with.
+- **Read-only steps without assistant text are skipped.** A turn containing only `read`, `grep`, `glob`, `find`,
+  `skill_search`, `skill_load` or `web_search` calls and their successful results adds no claim or side effect to judge.
+  New assistant text, failed results, other tools and unknown entries still get the usual review.
 - **Phases.** `phases` (`["plan", "execute"]` by default) restricts which omp mode the reviewer is active in.
   Set it to `["execute"]`, for example, to review only outside plan mode.
 
@@ -188,6 +191,16 @@ the advisory role, so notes are countable per role after a run. Gate messages us
 | `immuneTurns` | After a steer, further steers are downgraded for the rest of that model turn plus this many more. A turn is one model call. |
 
 `/adversary status` shows delivered, downgraded and suppressed counts by reason.
+
+Within one user prompt, successful judgments of the exact same model, role, question battery and full sanitized state
+(including evidence) are reused, and concurrent identical requests share one call. Changed inputs are judged again;
+delivery, escalation and note budgets still run on every review. Reuse consumes no paid-call budget and records zero
+new usage. Failed requests are not cached, and a new prompt or session clears the judgment cache.
+
+An HTTP 402 pauses all TypeSafe dispatches for that API key and endpoint for 60 seconds, across reviews, compaction
+and explicit asks. Calls during the pause fail with the original error; they do not reach the provider. The next
+call after the pause retries normally. Changing credentials or endpoint, or resetting the client, permits immediate
+recovery. Other failures retain their existing retry behavior.
 
 ## Ambiguity gate (plan mode)
 
@@ -322,8 +335,10 @@ cache reads is left alone: rewriting it would turn a cheap cached request into a
 What it sends to TypeSafe is listed in [What leaves your machine](#what-leaves-your-machine) and is masked by
 `adversary.redact`. The spill files are not masked: they hold the tool output as it was, readable by you only (mode 600 in
 a mode 700 directory), and nothing prunes them. A failure (an API error, a timeout, a malformed answer) leaves that request
-unreduced and is logged as `[typesafe] context compaction failed`. It does not run in subagent sessions (see
-[Subagents](#subagents)). Switch it off with `compaction.enabled: false`.
+unreduced and is logged as `[typesafe] context compaction failed`. A failed scoring batch cancels sibling requests
+from the same rewrite; successful partial answers remain cached. Compaction's `asks` statistic counts successful
+requests only, not failed attempts. It does not run in subagent sessions (see [Subagents](#subagents)).
+Switch it off with `compaction.enabled: false`.
 
 It is a port of [omp-jev-compaction](https://github.com/jerryfane/omp-jev-compaction) (MIT) onto this extension's client and
 config. The scoring core is vendored under `src/vendor/fast-jev/` from

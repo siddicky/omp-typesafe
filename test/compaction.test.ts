@@ -2,8 +2,8 @@ import { afterAll, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compact } from "../src/vendor/fast-jev/compact";
-import { collectToolCalls } from "../src/vendor/fast-jev/state";
+import { compact, questionsFor, resolveOptions } from "../src/vendor/fast-jev/compact";
+import { collectToolCalls, estimateTokens, fitState } from "../src/vendor/fast-jev/state";
 import type { JevAnswer, JevCacheKeys, JevQuestions, JevResponse, JevState, Message } from "../src/vendor/fast-jev/types";
 import type { OmpMessage, SignalAsker } from "../src/compaction";
 
@@ -113,7 +113,7 @@ function countingAsker(overrides: Record<string, number> = {}, fallback = 0.9): 
 
 /**
  * Answers instantly for the first `fastCalls` asks, hangs on the rest until `signal` aborts, then rejects.
- * The timer exception: the deadline under test is the reducer's own AbortSignal.timeout, and only the real
+ * The timer exception: the deadline under test is the reducer's own timer, and only the real
  * clock drives that, so the fake asker parks on a real abortable timer instead of fake timers.
  */
 function hangingAsker(fastCalls: number): FakeAsker & { fast: boolean } {
@@ -723,6 +723,61 @@ describe("the rewrite deadline", () => {
 		expect(resultTextOf(byCallId(out, "c1")!)).toContain("[fast-jev-compaction truncated");
 		expect(resultTextOf(byCallId(out, "c2")!)).toContain("[fast-jev-compaction truncated");
 	});
+
+	test("aborts sibling scoring transport when a parallel batch fails, preserving the original error", async () => {
+		const source = base(2, 1_500);
+		const goal = "ship safely";
+		const mapped: Message[] = [{ role: "user", text: "(start of this stretch of history)", toolUses: [] }, ...mapOmpMessages(source)];
+		const calls = collectToolCalls(mapped, 0);
+		const fitted = fitState(mapped, calls, resolveOptions({ goal, preserveRecentMessages: 0 }));
+		// Leave room for exactly one call's questions per request, forcing two parallel batches.
+		const maxRequestTokens = fitted.tokens + 20 + Math.max(...calls.map((call) => estimateTokens(JSON.stringify(questionsFor(call)))));
+		const failure = new Error("HTTP 402 payment required");
+		const signals: (AbortSignal | undefined)[] = [];
+		let completeSibling: (() => void) | undefined;
+		let finishSibling!: (outcome: "aborted" | "completed") => void;
+		const siblingDone = new Promise<"aborted" | "completed">((resolve) => {
+			finishSibling = resolve;
+		});
+		const asker: SignalAsker = {
+			async ask(_state, questions, _cacheKeys, signal) {
+				signals.push(signal);
+				if (signals.length === 1) throw failure;
+				return new Promise<JevResponse>((resolve, reject) => {
+					const answer = (): JevResponse => ({ answers: Object.fromEntries(Object.keys(questions).map((name) => [name, { type: "noul" as const, noul: 0.9 }])) });
+					const abort = () => {
+						finishSibling("aborted");
+						reject(new Error("sibling transport aborted"));
+					};
+					completeSibling = () => {
+						signal?.removeEventListener("abort", abort);
+						finishSibling("completed");
+						resolve(answer());
+					};
+					signal?.addEventListener("abort", abort, { once: true });
+				});
+			},
+		};
+		const reduce = createContextReducer(asker, { goal, minChars: 100, preserveRecentMessages: 0, maxRequestTokens, budgetMs: 5_000, spill: { enabled: false } });
+
+		try {
+			let caught: unknown;
+			try {
+				await reduce(source);
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).toBe(failure);
+			expect(signals).toHaveLength(2);
+			expect(signals[0]).toBe(signals[1]);
+			// Release the fake HTTP response only after the reducer fails: cancellation must win.
+			completeSibling!();
+			expect(await siblingDone).toBe("aborted");
+			expect(signals[0]?.aborted).toBe(true);
+		} finally {
+			completeSibling?.();
+		}
+	});
 });
 
 // ---- CachingAsker identity --------------------------------------------------------------------
@@ -823,6 +878,39 @@ describe("CachingAsker identity", () => {
 
 		expect(inner.calls).toBe(2);
 		expect(cached.cache.size).toBe(0);
+	});
+
+	test.each([false, true])("counts only successful inner asks (uncacheable state: %s)", async (uncacheable) => {
+		const inner = countingAsker();
+		const failure = new Error("HTTP 402 payment required");
+		let fail = true;
+		const cached = new CachingAsker({
+			async ask(state, questions, cacheKeys, signal) {
+				if (fail) throw failure;
+				return inner.ask(state, questions, cacheKeys, signal);
+			},
+		});
+		const state = cacheState("same history") as JevState & { self?: unknown };
+		if (uncacheable) state.self = state;
+		const keys = { call_t1: "same-content:call" };
+
+		await expect(cached.ask(state, cacheQuestions, keys)).rejects.toThrow(failure.message);
+		expect(cached.asks).toBe(0);
+
+		fail = false;
+		await cached.ask(state, cacheQuestions, keys);
+		expect(cached.asks).toBe(1);
+		await cached.ask(state, cacheQuestions, keys);
+		expect(cached.asks).toBe(uncacheable ? 2 : 1);
+		expect(inner.calls).toBe(cached.asks);
+		expect(cached.answered).toBe(uncacheable ? 0 : 1);
+
+		fail = true;
+		const changed = cacheState("changed history") as JevState & { self?: unknown };
+		if (uncacheable) changed.self = changed;
+		await expect(cached.ask(changed, cacheQuestions, keys)).rejects.toThrow(failure.message);
+		expect(cached.asks).toBe(uncacheable ? 2 : 1);
+		expect(inner.calls).toBe(cached.asks);
 	});
 
 	test("bounds retained state entries with LRU eviction", async () => {

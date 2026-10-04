@@ -178,6 +178,30 @@ function endedAbnormally(message: unknown): boolean {
 	return isRecord(message) && (message.stopReason === "aborted" || message.stopReason === "error");
 }
 
+const READ_ONLY_TOOLS: Record<string, true> = {
+	read: true,
+	grep: true,
+	glob: true,
+	find: true,
+	skill_search: true,
+	skill_load: true,
+	web_search: true,
+};
+
+/** No new claim or side effect to judge; unrecognized entries and failed results stay eligible. */
+function readOnlyStep(entries: EntryView[]): boolean {
+	return entries.length > 0 && entries.every((entry) => {
+		const message = entry.message;
+		if (!message) return false;
+		if (message.role === "assistant") {
+			return message.text.trim().length === 0 && message.toolCalls.length > 0
+				&& message.toolCalls.every((call) => READ_ONLY_TOOLS[call.name] === true);
+		}
+		return message.role === "toolResult" && !message.isError && message.toolName !== null
+			&& READ_ONLY_TOOLS[message.toolName] === true;
+	});
+}
+
 /** The start of the result omp gives a tool call it never started because the run was already stopped. */
 const RUN_STOPPED_PREFIX = "Tool was not executed because the run was aborted";
 /**
@@ -916,7 +940,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			// An aborted or failed model call, or a tool batch the user stopped, must not wake the agent with a note or a question.
 			if (isRecord(event) && (endedAbnormally(event.message) || interruptedBatch(event.toolResults))) return;
 			let reviewEvidence: Evidence | undefined;
-			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries)) {
+			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries) && !readOnlyStep(deltaEntries)) {
 				const delta = renderDelta(deltaEntries, 6000, redactOn(), skillTurns());
 				if (delta.trim().length > 0) {
 					// No git probes for a review the call budget would suppress anyway.

@@ -1,6 +1,6 @@
 import type { EntryType, Questions } from "@typesafe-ai/sdk";
 import { apiKeyPresent, ask, describeError, choice, noul, score } from "./client";
-import type { WireAnswer } from "./client";
+import type { AskResult, WireAnswer } from "./client";
 import { getConfig } from "./config";
 import type { TypesafeRole } from "./config";
 import { planModeActive, scanBranch } from "./branch";
@@ -282,6 +282,8 @@ interface NoteEntry {
 
 const history: ReviewRecord[] = [];
 const noteHistory: NoteEntry[] = [];
+/** Exact judgments, including in-flight work; bounded by the per-prompt call budget. */
+const reviewRequests = new Map<string, Promise<AskResult>>();
 const stats = {
 	delivered: { nit: 0, concern: 0, blocker: 0 },
 	suppressed: {} as Record<string, number>,
@@ -306,6 +308,7 @@ let unavailableNotified = false;
 export function resetReviewerSession(): void {
 	history.length = 0;
 	noteHistory.length = 0;
+	reviewRequests.clear();
 	stats.delivered.nit = 0;
 	stats.delivered.concern = 0;
 	stats.delivered.blocker = 0;
@@ -350,6 +353,7 @@ export function beginPrompt(): void {
 	promptSeq += 1;
 	callsThisPrompt = 0;
 	messageReviewsThisPrompt = 0;
+	reviewRequests.clear();
 }
 
 /**
@@ -698,16 +702,28 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			record(pi, kind, { severity: "none", decision: "suppressed", reason: "no_api_key", ...blank }, { inputTokens: 0, outputTokens: 0 });
 			return { severity: "none", decision: "suppressed", reason: "no_api_key" };
 		}
-		const budget = takeCall();
-		if (budget !== "ok") {
-			bumpSuppressed(budget);
-			record(pi, kind, { severity: "none", decision: "suppressed", reason: budget, ...blank }, { inputTokens: 0, outputTokens: 0 });
-			return { severity: "none", decision: "suppressed", reason: budget };
-		}
 		const battery = buildBattery(kind, role, { failed });
-		// `state` is assembled from strings, arrays and JSON-safe objects; the SDK wants its JSON-value type.
-		const { result } = await ask(state as EntryType, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
-		const usage = { inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0 };
+		// Reuse only the complete paid input, never a target or a finding: changed evidence can escalate.
+		const requestKey = JSON.stringify([getConfig().model, role, state, battery.questions]);
+		let pending = reviewRequests.get(requestKey);
+		const reused = pending !== undefined;
+		if (!pending) {
+			const budget = takeCall();
+			if (budget !== "ok") {
+				bumpSuppressed(budget);
+				record(pi, kind, { severity: "none", decision: "suppressed", reason: budget, ...blank }, { inputTokens: 0, outputTokens: 0 });
+				return { severity: "none", decision: "suppressed", reason: budget };
+			}
+			// `state` is assembled from strings, arrays and JSON-safe objects; the SDK wants its JSON-value type.
+			pending = ask(state as EntryType, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
+			reviewRequests.set(requestKey, pending);
+			const request = pending;
+			void request.catch(() => {
+				if (reviewRequests.get(requestKey) === request) reviewRequests.delete(requestKey);
+			});
+		}
+		const { result } = await pending;
+		const usage = { inputTokens: reused ? 0 : result.usage?.input_tokens ?? 0, outputTokens: reused ? 0 : result.usage?.output_tokens ?? 0 };
 		const answers = result.answers ?? {};
 		const severityAnswer = answers.severity as WireAnswer | undefined;
 		const sevScore = numField(severityAnswer, "score") ?? 0;

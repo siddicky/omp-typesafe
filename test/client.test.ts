@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { APITimeoutError, RateLimitError, TypeSafeError } from "@typesafe-ai/sdk";
+import { APIError, APITimeoutError, RateLimitError, TypeSafeError } from "@typesafe-ai/sdk";
 import { loadConfig } from "../src/config";
 import { LIMITS } from "./limits";
 
@@ -34,6 +34,7 @@ const {
 
 interface Seen {
 	model: unknown;
+	authorization: string | null;
 	retryCount: string | null;
 	at: number;
 }
@@ -76,7 +77,7 @@ beforeAll(() => {
 		port: 0,
 		async fetch(req) {
 			const body = (await req.json()) as Record<string, unknown>;
-			seen.push({ model: body.model, retryCount: req.headers.get("x-typesafe-retry-count"), at: Date.now() - t0 });
+			seen.push({ model: body.model, authorization: req.headers.get("authorization"), retryCount: req.headers.get("x-typesafe-retry-count"), at: Date.now() - t0 });
 			return handler(body, seen.length);
 		},
 	});
@@ -247,6 +248,155 @@ describe("client construction errors", () => {
 		}
 		resetClient();
 		expect(getClientError()).toBeNull();
+	});
+});
+
+describe("insufficient-credit cooldown", () => {
+	test("a 402 blocks shared ask calls before dispatch for exactly 60 seconds and preserves the original failure", async () => {
+		const realNow = Date.now;
+		let now = realNow();
+		Date.now = () => now;
+		handler = (body, attempt) => attempt === 1
+			? errorResponse(402, { "x-typesafe-request-id": "req_credit" })
+			: okResponse(body);
+		resetUsage();
+		try {
+			const failure = await ask("review", questions, { maxRetries: 2 }).catch((err: unknown) => err);
+			expect(failure).toBeInstanceOf(APIError);
+			expect((failure as APIError).status).toBe(402);
+			expect((failure as APIError).requestId).toBe("req_credit");
+			expect(seen).toHaveLength(1);
+
+			const immediate = await ask("compaction", questions).catch((err: unknown) => err);
+			expect(seen).toHaveLength(1);
+			expect(immediate).toBe(failure);
+			// A different configured or per-call model still uses the same depleted account.
+			await useConfig({ model: "jev-1.14.0" });
+			now += 59_999;
+			const blocked = await ask("tool", questions, { model: "jev-1.12.0" }).catch((err: unknown) => err);
+			expect(seen).toHaveLength(1);
+			expect(blocked).toBe(failure);
+			expect(getSessionUsage()).toEqual({ inputTokens: 0, outputTokens: 0, requests: 0 });
+
+			now += 1;
+			await ask("retry", questions);
+			await ask("paid calls remain enabled", questions);
+			expect(seen.map((s) => s.model)).toEqual(["jev-1.13.0", "jev-1.14.0", "jev-1.14.0"]);
+			expect(getSessionUsage()).toEqual({ inputTokens: 20, outputTokens: 2, requests: 2 });
+		} finally {
+			Date.now = realNow;
+			resetUsage();
+		}
+	});
+
+	test("another 402 after expiry starts a fresh bounded cooldown", async () => {
+		const realNow = Date.now;
+		let now = realNow();
+		Date.now = () => now;
+		handler = () => errorResponse(402);
+		try {
+			const first = await ask("first", questions).catch((err: unknown) => err);
+			expect(first).toBeInstanceOf(APIError);
+			now += 60_000;
+			const second = await ask("retry", questions).catch((err: unknown) => err);
+			expect(second).toBeInstanceOf(APIError);
+			expect(second).not.toBe(first);
+			expect(seen).toHaveLength(2);
+			now += 59_999;
+			const blocked = await ask("still depleted", questions).catch((err: unknown) => err);
+			expect(seen).toHaveLength(2);
+			expect(blocked).toBe(second);
+			handler = (body) => okResponse(body);
+			now += 1;
+			await ask("recovered", questions);
+			expect(seen).toHaveLength(3);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	test("resetClient permits an immediate retry after a 402", async () => {
+		handler = () => errorResponse(402);
+		const failure = await ask("first", questions).catch((err: unknown) => err);
+		expect(failure).toBeInstanceOf(APIError);
+		expect((failure as APIError).status).toBe(402);
+		handler = (body) => okResponse(body);
+		resetClient();
+		await ask("reset retry", questions);
+		expect(seen).toHaveLength(2);
+	});
+
+	test("changing the API key recovers immediately with the new credentials without resetClient", async () => {
+		const key = process.env.TYPESAFE_API_KEY;
+		handler = (body) => seen.at(-1)?.authorization === "Bearer recovered-key" ? okResponse(body) : errorResponse(402);
+		try {
+			const failure = await ask("depleted account", questions).catch((err: unknown) => err);
+			expect(failure).toBeInstanceOf(APIError);
+			expect((failure as APIError).status).toBe(402);
+			process.env.TYPESAFE_API_KEY = "recovered-key";
+			await ask("different account", questions);
+			expect(seen.map((s) => s.authorization)).toEqual(["Bearer test-key", "Bearer recovered-key"]);
+		} finally {
+			process.env.TYPESAFE_API_KEY = key;
+		}
+	});
+
+	test("changing the base URL recovers immediately without resetClient and never dispatches to the old endpoint", async () => {
+		const baseURL = process.env.TYPESAFE_BASE_URL;
+		let recoveredRequests = 0;
+		const recovered = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				recoveredRequests++;
+				return okResponse((await req.json()) as Record<string, unknown>);
+			},
+		});
+		handler = () => errorResponse(402);
+		try {
+			const failure = await ask("depleted endpoint", questions).catch((err: unknown) => err);
+			expect(failure).toBeInstanceOf(APIError);
+			expect((failure as APIError).status).toBe(402);
+			process.env.TYPESAFE_BASE_URL = `http://127.0.0.1:${recovered.port}`;
+			await ask("different endpoint", questions);
+			expect(seen).toHaveLength(1);
+			expect(recoveredRequests).toBe(1);
+		} finally {
+			process.env.TYPESAFE_BASE_URL = baseURL;
+			recovered.stop(true);
+		}
+	});
+
+	test("non-402 HTTP errors do not suppress the next request, even when the message mentions credits", async () => {
+		for (const status of [400, 401, 403, 422, 429, 500, 503]) {
+			handler = () => Response.json({ error: { message: "insufficient credits (402)" } }, { status });
+			const failure = await ask("failure", questions).catch((err: unknown) => err);
+			expect(failure).toBeInstanceOf(APIError);
+			expect((failure as APIError).status).toBe(status);
+			handler = (body) => okResponse(body);
+			await ask("retry", questions);
+		}
+		expect(seen).toHaveLength(14);
+	});
+
+	test("a caller abort does not suppress the next request", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const failure = await ask("aborted", questions, { signal: controller.signal }).catch((err: unknown) => err);
+		expect(describeError(failure)).toBe("aborted");
+		await ask("retry", questions);
+		expect(seen).toHaveLength(1);
+	});
+
+	test("an already-aborted caller takes precedence over the credit cooldown without dispatch", async () => {
+		handler = () => errorResponse(402);
+		const creditFailure = await ask("depleted", questions).catch((err: unknown) => err);
+		expect(creditFailure).toBeInstanceOf(APIError);
+		expect((creditFailure as APIError).status).toBe(402);
+		const controller = new AbortController();
+		controller.abort();
+		const failure = await ask("aborted", questions, { signal: controller.signal }).catch((err: unknown) => err);
+		expect(describeError(failure)).toBe("aborted");
+		expect(seen).toHaveLength(1);
 	});
 });
 
