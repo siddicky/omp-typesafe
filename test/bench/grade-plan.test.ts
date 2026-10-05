@@ -184,6 +184,8 @@ describe("callJudgeValidated: isolation and caching (bench_ci-judge-not-isolated
 		expect(args[args.indexOf("--output-format") + 1]).toBe("json");
 		const schema = JSON.parse(args[args.indexOf("--json-schema") + 1]);
 		expect(schema.properties.criteria.items.properties.met.type).toBe("boolean");
+		expect(args).toContain("--model");
+		expect(args[args.indexOf("--model") + 1]).toBe(process.env.BENCH_JUDGE_MODEL?.trim() || "claude-opus-5");
 		expect(args[args.length - 1].endsWith(`PLAN:\n---\n${plan}\n---`)).toBe(true);
 
 		const cwd = (await readFile(process.env.FAKE_CLAUDE_CWD as string, "utf8")).trim();
