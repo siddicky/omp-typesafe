@@ -363,6 +363,11 @@ The harness is covered by `bun test` (the files live under `test/bench/`, becaus
 `report.ts` and `grade-plan.ts` against a fake `omp`, a fake `claude` and a loopback fake of the TypeSafe API, and
 a contract test that runs the real extension. They need no network and no installed `omp` or `claude`.
 
+For the focused plan-grader regressions, run `bun test test/bench/grade-plan.test.ts`. The suite compiles its
+existing fake Claude into a native executable with the current Bun runtime on Windows or POSIX, and gives it
+an isolated `PATH`; fixture setup failures cannot fall through to an installed Claude. Both `grade-plan.ts`
+CLI modes accept native absolute paths, including Windows drive-letter paths.
+
 ## Known limits
 
 - **No real-omp end-to-end test.** CI exercises the harness against fakes; the extension itself runs for real only

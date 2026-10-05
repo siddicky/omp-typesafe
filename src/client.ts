@@ -19,8 +19,12 @@ import { getConfig } from "./config";
  */
 
 let client: TypeSafeClient | null = null;
-/** Configured model the cached client was built with; a config reload that changes it rebuilds the client. */
+/** Configuration and credentials the cached client was built with; changes rebuild the client. */
 let clientModel: string | null = null;
+let clientApiKey: string | undefined;
+let clientBaseURL: string | undefined;
+/** Account/endpoint-scoped: model changes must not bypass an insufficient-credit response. */
+let creditCooldown: { apiKey: string | undefined; baseURL: string | undefined; error: APIError; until: number } | null = null;
 let clientError: string | null = null;
 
 /** omp's extension logger: every method optional, extra args passed through. */
@@ -72,14 +76,20 @@ export function apiKeyPresent(): boolean {
  */
 export function getClient(): TypeSafeClient {
 	const model = getConfig().model;
-	if (client && clientModel === model) return client;
+	const apiKey = process.env.TYPESAFE_API_KEY?.trim() || undefined;
+	const baseURL = (process.env.TYPESAFE_BASE_URL?.trim() || undefined)?.replace(/\/+$/, "");
+	if (client && clientModel === model && clientApiKey === apiKey && clientBaseURL === baseURL) return client;
 	try {
 		client = new TypeSafeClient({ defaultModel: model, logLevel: "warn", logger: routedLogger });
 		clientModel = model;
+		clientApiKey = apiKey;
+		clientBaseURL = baseURL;
 		clientError = null;
 	} catch (err) {
 		client = null;
 		clientModel = null;
+		clientApiKey = undefined;
+		clientBaseURL = undefined;
 		clientError = describeError(err);
 		throw err;
 	}
@@ -94,6 +104,9 @@ export function getClientError(): string | null {
 export function resetClient(): void {
 	client = null;
 	clientModel = null;
+	clientApiKey = undefined;
+	clientBaseURL = undefined;
+	creditCooldown = null;
 	clientError = null;
 	lastResolvedModel = null;
 }
@@ -201,8 +214,15 @@ export async function ask(
 	try {
 		// A 429 is retried here, not by the SDK: only when it names a wait the caller can afford, within maxRetries.
 		for (let rateLimited = 0; ; rateLimited++) {
+			if (controller.signal.aborted) throw new APIUserAbortError(undefined, { cause: controller.signal.reason });
+			const sdkClient = getClient();
+			const apiKey = clientApiKey;
+			const baseURL = clientBaseURL;
+			if (creditCooldown && creditCooldown.apiKey === apiKey && creditCooldown.baseURL === baseURL && Date.now() < creditCooldown.until) {
+				throw creditCooldown.error;
+			}
 			try {
-				const promise = getClient().systemOne(
+				const promise = sdkClient.systemOne(
 					{ state, questions, ...(opts.model ? { model: opts.model } : {}) },
 					{
 						timeout: timeoutMs,
@@ -230,6 +250,10 @@ export async function ask(
 					requestId: wrapped.requestId,
 				};
 			} catch (err) {
+				if (err instanceof APIError && err.status === 402) {
+					creditCooldown = { apiKey, baseURL, error: err, until: Date.now() + 60_000 };
+					throw err;
+				}
 				const wait = err instanceof RateLimitError ? (err.retryAfterMs ?? RATE_LIMIT_BACKOFF_MS * 2 ** rateLimited) : Number.POSITIVE_INFINITY;
 				if (rateLimited >= maxRetries || wait > MAX_RETRY_WAIT_MS) throw err;
 				await waitUnlessAborted(wait, controller.signal);

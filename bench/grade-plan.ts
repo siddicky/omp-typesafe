@@ -19,7 +19,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Questions } from "@typesafe-ai/sdk";
 import { apiKeyPresent, ask, describeError, noul } from "../src/client";
 import { JEV_GRADER_MODEL, jevVerdict, loadTypesafeKey, runProcess } from "./lib/grade-common";
@@ -516,10 +516,6 @@ export function mergePlanGradeIntoRow(row: Record<string, unknown>, g: PlanGrade
 	}
 }
 
-function resolvePath(p: string): string {
-	return p.startsWith("/") ? p : join(process.cwd(), p);
-}
-
 /**
  * Re-scores every plan-type row already recorded in <resultsDir>/runs.jsonl,
  * in place, without re-running omp. Useful when the judge itself was buggy
@@ -575,7 +571,7 @@ if (import.meta.main) {
 			console.error("usage: bun run bench/grade-plan.ts --rescore <resultsDir>");
 			process.exit(1);
 		}
-		const summary = await rescoreResultsDir(resolvePath(resultsDirArg));
+		const summary = await rescoreResultsDir(resolve(resultsDirArg));
 		console.log(JSON.stringify(summary, null, 2));
 	} else {
 		const [runDirArg, taskDirArg] = argv;
@@ -583,6 +579,6 @@ if (import.meta.main) {
 			console.error("usage: bun run bench/grade-plan.ts <runDir> <taskDir>\n   or: bun run bench/grade-plan.ts --rescore <resultsDir>");
 			process.exit(1);
 		}
-		gradePlan(resolvePath(runDirArg), resolvePath(taskDirArg)).then((r) => console.log(JSON.stringify(r, null, 2)));
+		gradePlan(resolve(runDirArg), resolve(taskDirArg)).then((r) => console.log(JSON.stringify(r, null, 2)));
 	}
 }

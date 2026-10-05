@@ -273,6 +273,62 @@ const reviewCalls = () => mockState.calls.filter((c) => "severity" in c.question
 const gateCalls = () => mockState.calls.filter((c) => "goal_clarity" in c.questions);
 const scores = () => ambiguity.getAmbiguityTelemetry().scores;
 
+describe("read-only turn eligibility", () => {
+	const call = (name: string, text = "") => ({
+		type: "message",
+		message: { role: "assistant", content: [{ type: "text", text }, { type: "toolCall", name, input: { path: "a.ts" } }] },
+	});
+	const result = (name: string, isError = false) => ({
+		type: "message",
+		message: { role: "toolResult", toolName: name, isError, content: [{ type: "text", text: "newly read source" }] },
+	});
+	const turnEnd = (h: Harness) => h.fire("turn_end", { message: { role: "assistant", stopReason: "toolUse" }, toolResults: [] });
+
+	test.each(["adversarial", "advisory"])("skips text-free successful read-only steps before paying or probing (%s)", async (role) => {
+		const h = setup({ role }, [userMsg("fix the bug")]);
+		await h.start();
+		for (const [turnIndex, tool] of ["read", "grep", "glob", "find", "skill_search", "skill_load", "web_search", "wait", "todo"].entries()) {
+			await h.fire("turn_start", { turnIndex });
+			const probes = h.execCalls.length;
+			h.branch.push(call(tool), result(tool));
+			await turnEnd(h);
+			expect(reviewCalls()).toHaveLength(0);
+			expect(h.execCalls).toHaveLength(probes);
+		}
+	});
+
+	test("keeps reviews for text, other tools, failures, changed tasks and unknown entries", async () => {
+		const deltas = [
+			[call("read", "This proves the bug is fixed"), result("read")],
+			[call("bash"), result("bash")],
+			[call("read"), call("edit"), result("read"), result("edit")],
+			[call("unknown"), result("unknown")],
+			[call("read"), result("read", true)],
+			[call("read"), result("read"), userMsg("also migrate callers")],
+			[call("read"), result("read"), marker("unknown-context")],
+		];
+		for (const delta of deltas) {
+			mockState.calls = [];
+			const h = setup({}, [userMsg("fix the bug")]);
+			await h.start();
+			await h.fire("turn_start", { turnIndex: 0 });
+			h.branch.push(...delta);
+			await turnEnd(h);
+			expect(reviewCalls()).toHaveLength(1);
+		}
+	});
+
+	test("skipping a read-only review does not skip the plan ambiguity gate", async () => {
+		const h = setup({}, [planMode(), userMsg("Make it better")]);
+		await h.start();
+		await h.fire("turn_start", { turnIndex: 0 });
+		h.branch.push(call("read"), result("read"));
+		await turnEnd(h);
+		expect(reviewCalls()).toHaveLength(0);
+		expect(gateCalls()).toHaveLength(1);
+	});
+});
+
 async function toolResult(
 	h: Harness,
 	toolName: string,
@@ -1442,7 +1498,7 @@ describe("per-prompt budgets and turn wiring", () => {
 		const text = "x".repeat(300);
 		for (let turn = 0; turn <= reviewer.MAX_MESSAGE_REVIEWS_PER_PROMPT; turn++) {
 			await h.fire("turn_start", { turnIndex: turn });
-			await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text }] } });
+			await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: `${text} turn ${turn}` }] } });
 		}
 		expect(reviewCalls().length).toBe(reviewer.MAX_MESSAGE_REVIEWS_PER_PROMPT);
 		await h.fire("agent_start");
@@ -1458,7 +1514,7 @@ describe("per-prompt budgets and turn wiring", () => {
 		const text = "x".repeat(300);
 		for (let turn = 0; turn < reviewer.MAX_MESSAGE_REVIEWS_PER_PROMPT; turn++) {
 			await h.fire("turn_start", { turnIndex: turn });
-			await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text }] } });
+			await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: `${text} turn ${turn}` }] } });
 		}
 		await h.fire("turn_start", { turnIndex: 99 });
 		await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text }] } });
@@ -2940,7 +2996,7 @@ describe("subagent sessions", () => {
 		await h.fire("agent_start");
 		for (let turn = 0; turn <= reviewer.MAX_MESSAGE_REVIEWS_PER_PROMPT; turn++) {
 			await h.fire("turn_start", { turnIndex: turn });
-			await h.fire("message_end", longMessage);
+			await h.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: `${"x".repeat(300)} turn ${turn}` }] } });
 		}
 		expect(reviewCalls().length).toBe(reviewer.MAX_MESSAGE_REVIEWS_PER_PROMPT);
 		await h.fire("agent_start", {}, subCtx(h));

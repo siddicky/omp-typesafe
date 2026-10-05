@@ -276,8 +276,9 @@ export class CachingAsker implements SignalAsker {
 	async ask(state: JevState, questions: JevQuestions, cacheKeys: JevCacheKeys = {}, signal?: AbortSignal): Promise<JevResponse> {
 		const stateIdentity = digest(state);
 		if (!stateIdentity) {
+			const fresh = await this.inner.ask(state, questions, cacheKeys, signal);
 			this.asks += 1;
-			return this.inner.ask(state, questions, cacheKeys, signal);
+			return fresh;
 		}
 
 		const missing: JevQuestions = {};
@@ -302,8 +303,8 @@ export class CachingAsker implements SignalAsker {
 			}
 		}
 		if (Object.keys(missing).length > 0) {
-			this.asks += 1;
 			const fresh = await this.inner.ask(state, missing, missingKeys, signal);
+			this.asks += 1;
 			for (const [name, answer] of Object.entries(fresh.answers)) {
 				const key = pendingKeys[name];
 				if (key) this.remember(key, answer);
@@ -477,8 +478,6 @@ export function createContextReducer(asker: SignalAsker, settings: ContextReduce
 			return reused;
 		}
 
-		const signal = AbortSignal.timeout(budgetMs);
-		const scoped: SignalAsker = { ask: (s, q, k) => cachingAsker.ask(s, q, k, signal) };
 		const windows = splitIntoWindows(mapped, settings.maxWindowChars ?? MAX_WINDOW_CHARS);
 		// Two properties of the whole conversation, not of one window. The core derives the goal (the last three user prompts)
 		// from the messages it is given, and every window after the first holds none of them, only the sentinel below, so Jev
@@ -493,6 +492,12 @@ export function createContextReducer(asker: SignalAsker, settings: ContextReduce
 		}
 		const keptAll: Message[] = [];
 		let dropped = 0;
+		const controller = new AbortController();
+		const timeoutController = new AbortController();
+		const timeoutSignal = timeoutController.signal;
+		const signal = AbortSignal.any([controller.signal, timeoutSignal]);
+		const timer = setTimeout(() => timeoutController.abort(new DOMException("The operation timed out", "TimeoutError")), budgetMs);
+		const scoped: SignalAsker = { ask: (s, q, k) => cachingAsker.ask(s, q, k, signal) };
 		try {
 			for (const [w, window] of windows.entries()) {
 				// The core always pins index 0 (the first message). A window frequently begins with the assistant message
@@ -510,8 +515,11 @@ export function createContextReducer(asker: SignalAsker, settings: ContextReduce
 				keptAll.push(...result.messages.filter((message) => message !== sentinel));
 			}
 		} catch (err) {
-			if (signal.aborted) throw new Error(`scoring did not finish within ${budgetMs} ms`, { cause: err });
+			if (timeoutSignal.aborted) throw new Error(`scoring did not finish within ${budgetMs} ms`, { cause: err });
 			throw err;
+		} finally {
+			clearTimeout(timer);
+			controller.abort();
 		}
 
 		const replacements = buildReplacements(messages, keptAll, { ...settings.spill, headChars: settings.truncateHeadChars ?? settings.spill?.headChars });

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { chmod, readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { clientMock, installClientMock, noulAnswer, resetClientMock, type AskCall } from "./mock-client";
 import { cleanupTmp, TASKS_DIR, tmp, write } from "./grader-helpers";
@@ -30,23 +31,23 @@ const saved: Record<string, string | undefined> = {};
 const FAKE_ENV = ["FAKE_CLAUDE_ARGS", "FAKE_CLAUDE_CWD", "FAKE_CLAUDE_COUNT", "FAKE_CLAUDE_OUT", "FAKE_CLAUDE_FAIL", "BENCH_JUDGE_CACHE_DIR", "BENCH_JUDGE_ISOLATION"];
 
 beforeAll(async () => {
-	binDir = await tmp("bench-fakebin-");
-	const script = `#!/bin/sh
-printf '%s\\0' "$@" > "$FAKE_CLAUDE_ARGS"
-pwd > "$FAKE_CLAUDE_CWD"
-echo x >> "$FAKE_CLAUDE_COUNT"
-if [ -n "$FAKE_CLAUDE_FAIL" ]; then echo "claude exploded" >&2; exit 1; fi
-cat "$FAKE_CLAUDE_OUT"
-`;
-	await writeFile(join(binDir, "claude"), script);
-	await chmod(join(binDir, "claude"), 0o755);
 	savedPath = process.env.PATH;
-	process.env.PATH = `${binDir}:${savedPath}`;
 	for (const k of FAKE_ENV) saved[k] = process.env[k];
-});
+	// Never fall through to an installed Claude, including when fixture setup fails.
+	process.env.PATH = "";
+	binDir = await tmp("bench-fakebin-");
+	process.env.PATH = binDir;
+	const built = spawnSync(
+		process.execPath,
+		["build", join(import.meta.dir, "fake-claude.ts"), "--compile", "--outfile", join(binDir, process.platform === "win32" ? "claude.exe" : "claude")],
+		{ cwd: binDir, encoding: "utf8" },
+	);
+	if (built.status !== 0) throw new Error(`fake Claude compilation failed: ${built.error ?? built.stderr}`);
+}, 120_000);
 
 afterAll(async () => {
-	process.env.PATH = savedPath;
+	if (savedPath === undefined) delete process.env.PATH;
+	else process.env.PATH = savedPath;
 	for (const k of FAKE_ENV) {
 		if (saved[k] === undefined) delete process.env[k];
 		else process.env[k] = saved[k];
@@ -170,7 +171,8 @@ describe("callJudgeValidated: isolation and caching (bench_ci-judge-not-isolated
 
 	test("the judge runs isolated, tool-less, schema-constrained and in a fresh temp cwd", async () => {
 		await judgeReplies(structured(criteria(true, false, true)));
-		const out = await callJudgeValidated("PLAN TEXT", RUBRIC);
+		const plan = "PLAN TEXT\n  spaces\t\"double quotes\" 'single quotes' \\ 雪 😀  ";
+		const out = await callJudgeValidated(plan, RUBRIC);
 		expect(out.map((c) => c.met)).toEqual([true, false, true]);
 
 		const args = await judgeArgs();
@@ -182,11 +184,11 @@ describe("callJudgeValidated: isolation and caching (bench_ci-judge-not-isolated
 		expect(args[args.indexOf("--output-format") + 1]).toBe("json");
 		const schema = JSON.parse(args[args.indexOf("--json-schema") + 1]);
 		expect(schema.properties.criteria.items.properties.met.type).toBe("boolean");
-		expect(args[args.indexOf("--model") + 1]).toBe("claude-opus-5");
-		expect(args[args.length - 1]).toContain("PLAN TEXT");
+		expect(args).toContain("--model");
+		expect(args[args.indexOf("--model") + 1]).toBe(process.env.BENCH_JUDGE_MODEL?.trim() || "claude-opus-5");
+		expect(args[args.length - 1].endsWith(`PLAN:\n---\n${plan}\n---`)).toBe(true);
 
 		const cwd = (await readFile(process.env.FAKE_CLAUDE_CWD as string, "utf8")).trim();
-		expect(cwd.length).toBeGreaterThan(0);
 		expect(cwd).not.toBe(process.cwd());
 		expect(cwd.includes("bench-judge-")).toBe(true);
 	});
@@ -545,4 +547,22 @@ describe("rescore keeps good values on failure (bench_ci-judge-parsing)", () => 
 		]);
 		expect(fields.planJudgeScore).toBe(1);
 	});
+});
+
+test("the CLI grades absolute run and task paths offline", async () => {
+	const runDir = await runDirWithPlan(GOOD_PLAN);
+	const taskDir = await tmp("bench-cli-task-");
+	const cwd = await tmp("bench-cli-cwd-");
+	await write(taskDir, "task.json", JSON.stringify({ id: "cli-absolute-paths", planPrompt: "p", rubric: ["r"], checklist: [], checklistQuestions: [] }));
+	await judgeReplies(structured(criteria(true)));
+	const cli = join(import.meta.dir, "..", "..", "bench", "grade-plan.ts");
+	const grade = spawnSync(process.execPath, [cli, runDir, taskDir], {
+		cwd,
+		env: { ...process.env, PATH: binDir, TYPESAFE_API_KEY: "offline-fixture", TYPESAFE_BASE_URL: "http://127.0.0.1:1" },
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	expect(grade.status).toBe(0);
+	expect(JSON.parse(grade.stdout)).toMatchObject({ planPath: join(runDir, "plans", "plan.md"), judgeScore: 1, judgeUngraded: 0 });
+	expect(await judgeCalls()).toBe(1);
 });
