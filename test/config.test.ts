@@ -457,8 +457,31 @@ describe("mergeConfig — adversary.tools", () => {
 
 describe("mergeConfig — pipeline", () => {
 	test("the defaults: the plan guard, skill awareness and spec checks on, the approval guard (it blocks) off", () => {
-		expect(DEFAULT_CONFIG.pipeline).toEqual({ planGuard: true, skillAware: true, skills: ["deep-interview", "ralplan", "dag"], specChecks: true, approvalGuard: false });
+		expect(DEFAULT_CONFIG.pipeline).toEqual({
+			planGuard: true,
+			skillAware: true,
+			skills: ["deep-interview", "ralplan", "dag"],
+			specChecks: true,
+			approvalGuard: false,
+			jev: { enabled: true, planFloor: 0.5, specFloor: 0.45, approvalFloor: 0.85, timeoutMs: 2500 },
+		});
 		expect(mergeConfig(DEFAULT_CONFIG, {}).pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+	});
+
+	test("jev: the file can change each key, and mistyped values keep the base value", () => {
+		const cfg = mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { enabled: false, planFloor: 0.9, specFloor: 0.2, approvalFloor: 0.95, timeoutMs: 5000 } } });
+		expect(cfg.pipeline.jev).toEqual({ enabled: false, planFloor: 0.9, specFloor: 0.2, approvalFloor: 0.95, timeoutMs: 5000 });
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { enabled: "no", planFloor: "high", timeoutMs: "slow" } } }).pipeline.jev).toEqual(DEFAULT_CONFIG.pipeline.jev);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: null } }).pipeline.jev).toEqual(DEFAULT_CONFIG.pipeline.jev);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: {} }).pipeline.jev).toEqual(DEFAULT_CONFIG.pipeline.jev);
+	});
+
+	test("jev: numbers are clamped to their ranges", () => {
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { planFloor: 2 } } }).pipeline.jev.planFloor).toBe(1);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { specFloor: -1 } } }).pipeline.jev.specFloor).toBe(0);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { approvalFloor: 2 } } }).pipeline.jev.approvalFloor).toBe(1);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { timeoutMs: 1e9 } } }).pipeline.jev.timeoutMs).toBe(10_000);
+		expect(mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { timeoutMs: 0 } } }).pipeline.jev.timeoutMs).toBe(250);
 	});
 
 	test("the file can change each switch, and a value that is not a boolean keeps the base value", () => {
@@ -512,6 +535,19 @@ describe("applyEnvOverrides — TYPESAFE_PIPELINE_GUARD", () => {
 		warnings.length = 0;
 		expect(applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_GUARD: "  " }, (m) => warnings.push(m))).toEqual(DEFAULT_CONFIG);
 		expect(warnings).toEqual([]);
+	});
+});
+
+describe("applyEnvOverrides — TYPESAFE_PIPELINE_JEV", () => {
+	test.each(["0", "false", "off", "no"])("=%j is the kill switch of the pipeline Jev second opinions, and of nothing else", (value) => {
+		const out = applyEnvOverrides(DEFAULT_CONFIG, { TYPESAFE_PIPELINE_JEV: value });
+		expect(out.pipeline).toEqual({ ...DEFAULT_CONFIG.pipeline, jev: { ...DEFAULT_CONFIG.pipeline.jev, enabled: false } });
+		expect({ ...out, pipeline: DEFAULT_CONFIG.pipeline }).toEqual(DEFAULT_CONFIG);
+	});
+
+	test("=1 turns them back on over a file that turned them off", () => {
+		const off = mergeConfig(DEFAULT_CONFIG, { pipeline: { jev: { enabled: false } } });
+		expect(applyEnvOverrides(off, { TYPESAFE_PIPELINE_JEV: "1" }).pipeline.jev.enabled).toBe(true);
 	});
 });
 
@@ -626,6 +662,7 @@ describe("loadConfig", () => {
 		TYPESAFE_ROLE: process.env.TYPESAFE_ROLE,
 		TYPESAFE_AMBIGUITY_THRESHOLD: process.env.TYPESAFE_AMBIGUITY_THRESHOLD,
 		TYPESAFE_PIPELINE_GUARD: process.env.TYPESAFE_PIPELINE_GUARD,
+		TYPESAFE_PIPELINE_JEV: process.env.TYPESAFE_PIPELINE_JEV,
 	};
 	const dir = mkdtempSync(join(tmpdir(), "omp-typesafe-config-"));
 	let n = 0;
@@ -663,7 +700,7 @@ describe("loadConfig", () => {
 	});
 
 	function clearOverrides(): void {
-		for (const key of ["TYPESAFE_REVIEW_ENABLED", "TYPESAFE_AMBIGUITY_GATE", "TYPESAFE_DEFAULT_MODEL", "TYPESAFE_ROLE", "TYPESAFE_AMBIGUITY_THRESHOLD", "TYPESAFE_PIPELINE_GUARD"]) {
+		for (const key of ["TYPESAFE_REVIEW_ENABLED", "TYPESAFE_AMBIGUITY_GATE", "TYPESAFE_DEFAULT_MODEL", "TYPESAFE_ROLE", "TYPESAFE_AMBIGUITY_THRESHOLD", "TYPESAFE_PIPELINE_GUARD", "TYPESAFE_PIPELINE_JEV"]) {
 			delete process.env[key];
 		}
 	}
@@ -692,14 +729,14 @@ describe("loadConfig", () => {
 		expect(warned).toHaveLength(1);
 	});
 
-	// The pipeline features make no paid call, so an unreadable file does not touch them: the guard that blocks stays at its
-	// default (on) and the opt-in one stays off.
-	test("a malformed file leaves the pipeline features at their defaults", async () => {
+	// The exact pipeline checks make no paid call, so an unreadable file does not touch them: the guard that blocks stays at its
+	// default (on) and the opt-in one stays off. The Jev second opinions do send text, so they fail closed like the reviewer.
+	test("a malformed file leaves the pipeline features at their defaults, except the Jev second opinions", async () => {
 		clearOverrides();
 		useConfigFile('{ "pipeline": { "planGuard": false, ');
 		const cfg = await loadConfig();
 		expect(cfg.adversary.enabled).toBe(false);
-		expect(cfg.pipeline).toEqual(DEFAULT_CONFIG.pipeline);
+		expect(cfg.pipeline).toEqual({ ...DEFAULT_CONFIG.pipeline, jev: { ...DEFAULT_CONFIG.pipeline.jev, enabled: false } });
 	});
 
 	test("TYPESAFE_PIPELINE_GUARD wins over the file, either way", async () => {

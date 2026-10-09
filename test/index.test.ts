@@ -81,6 +81,7 @@ const ENV_KEYS = [
 	"TYPESAFE_BENCH_LOG",
 	"TYPESAFE_SUBAGENT_GUARD",
 	"TYPESAFE_PIPELINE_GUARD",
+	"TYPESAFE_PIPELINE_JEV",
 	"PI_CODING_AGENT_DIR",
 ];
 const savedEnv: Record<string, string | undefined> = {};
@@ -130,6 +131,7 @@ afterEach(() => {
 	delete process.env.TYPESAFE_ROLE;
 	delete process.env.TYPESAFE_SUBAGENT_GUARD;
 	delete process.env.TYPESAFE_PIPELINE_GUARD;
+	delete process.env.TYPESAFE_PIPELINE_JEV;
 });
 
 const replies: { gate: Answers; review: Answers; stop: Answers; other: Answers } = { gate: {}, review: {}, stop: {}, other: {} };
@@ -3262,6 +3264,7 @@ describe("pipeline (omp-skills)", () => {
 		const cell = (code: string, language = "py") => ({ toolName: "eval", toolCallId: "e1", input: { language, code } });
 		const DAG_CELL = cell("state = await run_dag(state_path='.omp/pipeline/dag/login.json')");
 		const REASON = "run_dag() cannot run in plan mode: dag workers are read-only there (no write, bash or eval), so every node would end blocked. Nothing was run. Ask the user to leave plan mode (Shift+Tab or /plan), then re-run the cell. Do not retry before they have.";
+		const JEV_REASON = "Jev judged this cell to start or stage a dag run (run_dag()/prepare_dag()), which cannot run in plan mode: dag workers are read-only there (no write, bash or eval), so every node would end blocked. Nothing was run. Ask the user to leave plan mode (Shift+Tab or /plan), then re-run the cell. Do not retry before they have.";
 
 		test("an eval cell that calls run_dag in plan mode is blocked with the reason, and nothing else happens", async () => {
 			const h = setup({}, [planMode(), userMsg("run the dag")], { hasUI: true });
@@ -3323,6 +3326,92 @@ describe("pipeline (omp-skills)", () => {
 			for (const code of ["await runner.run_dag(x)", "result = await run_dag (\n  state_path=x)", 'print(f"{await run_dag(state_path=x)}")', "def go():\n    return run_dag(x)"]) {
 				expect((await h.fire("tool_call", cell(code)))?.block, code).toBe(true);
 			}
+		});
+
+		test("a dag runner by a computed name goes to Jev: a high score blocks, a low one and an error let it run", async () => {
+			const sneaky = cell('state = globals()["run_dag"](state)');
+			mockState.respond = () => ({ starts_dag_run: { type: "noul", noul: 0.55 } });
+			const blocked = setup({}, [planMode(), userMsg("run the dag")]);
+			await blocked.start();
+			mockState.calls.length = 0;
+			const verdict = await blocked.fire("tool_call", sneaky);
+			expect(verdict).toEqual({ block: true, reason: JEV_REASON });
+			expect(mockState.calls).toHaveLength(1);
+			expect(await status(blocked)).toContain("plan guard on (blocked=1)");
+
+			mockState.respond = () => ({ starts_dag_run: { type: "noul", noul: 0.45 } });
+			const allowed = setup({}, [planMode(), userMsg("run the dag")]);
+			await allowed.start();
+			mockState.calls.length = 0;
+			expect(await allowed.fire("tool_call", sneaky)).toBeUndefined();
+			expect(mockState.calls).toHaveLength(1);
+
+			mockState.respond = () => {
+				throw new Error("Jev down");
+			};
+			const failed = setup({}, [planMode(), userMsg("run the dag")]);
+			await failed.start();
+			mockState.calls.length = 0;
+			expect(await failed.fire("tool_call", sneaky)).toBeUndefined();
+			expect(mockState.calls).toHaveLength(1);
+		});
+
+		test("a computed-name cell makes no Jev call without a key, with pipeline.jev off, under TYPESAFE_PIPELINE_JEV=0, or in a subagent", async () => {
+			const sneaky = cell('state = globals()["run_dag"](state)');
+			mockState.respond = () => ({ starts_dag_run: { type: "noul", noul: 0.99 } });
+			const branch = [planMode(), userMsg("run the dag")];
+			const silent = async (h: Harness, ctx?: Record<string, any>) => {
+				await h.start();
+				mockState.calls.length = 0;
+				expect(await h.fire("tool_call", sneaky, ctx)).toBeUndefined();
+				expect(mockState.calls).toEqual([]);
+			};
+			mockState.apiKey = false;
+			await silent(setup({}, branch));
+			mockState.apiKey = true;
+			await silent(setup({ pipeline: { jev: { enabled: false } } }, branch));
+			process.env.TYPESAFE_PIPELINE_JEV = "0";
+			await silent(setup({}, branch));
+			delete process.env.TYPESAFE_PIPELINE_JEV;
+			const h = setup({}, branch);
+			await silent(h, subCtx(h, [planMode()]));
+		});
+
+		test("the cell Jev sees is redacted unless adversary.redact is off", async () => {
+			// Key shapes are assembled at runtime so only the test process ever holds them whole.
+			const aws = ["AKIA", "IOSFODNN7", "EXAMPLE"].join("");
+			const sneaky = cell(`key = "${aws}"\nglobals()["run_dag"](key)`);
+			mockState.respond = () => ({ starts_dag_run: { type: "noul", noul: 0.1 } });
+			const redacted = setup({}, [planMode(), userMsg("run the dag")]);
+			await redacted.start();
+			mockState.calls.length = 0;
+			await redacted.fire("tool_call", sneaky);
+			const { code: masked }: { code: string } = mockState.calls[0].state;
+			expect(masked).not.toContain(aws);
+			expect(masked).toContain("[REDACTED]");
+
+			const raw = setup({ adversary: { redact: false } }, [planMode(), userMsg("run the dag")]);
+			await raw.start();
+			mockState.calls.length = 0;
+			await raw.fire("tool_call", sneaky);
+			const { code: unmasked }: { code: string } = mockState.calls[0].state;
+			expect(unmasked).toContain(aws);
+		});
+
+		test("cells that never name a dag runner cost no Jev call", async () => {
+			const h = setup({}, [planMode()]);
+			await h.start();
+			mockState.calls.length = 0;
+			for (const event of [
+				cell("print(1)"),
+				cell("# run the dag tomorrow"),
+				cell("await run_dag(state_path=x)", "js"),
+				{ toolName: "eval", toolCallId: "e9", input: { code: 42 } },
+				{ toolName: "write", toolCallId: "w9", input: { path: "x.py", content: "run_dag()" } },
+			]) {
+				expect(await h.fire("tool_call", event)).toBeUndefined();
+			}
+			expect(mockState.calls).toEqual([]);
 		});
 
 		test("pipeline.planGuard false, and TYPESAFE_PIPELINE_GUARD, switch it off; the environment wins over the file", async () => {
@@ -3840,10 +3929,51 @@ describe("pipeline (omp-skills)", () => {
 			expect(message.content).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="1"`);
 			expect(message.content).toContain('could not verify the quote in anything the user said this session: "every route"');
 			expect(message.content).toContain("before you ask the user to approve it");
-			// A local check: no Jev call, no git, and the notes count shows in the status.
-			expect(mockState.calls).toEqual([]);
+			// The local problem plus a Jev second opinion: one call with the spec questions, no git, and the notes count shows in the status.
+			expect(mockState.calls).toHaveLength(1);
+			expect(Object.keys(mockState.calls[0].questions).sort()).toEqual(["unfounded_decisions", "vague_acceptance"]);
+			expect(mockState.calls[0].opts).toMatchObject({ timeoutMs: 2500, maxRetries: 0 });
+			const sent = mockState.calls[0].state as { spec: string; user_turns: string[] };
+			expect(sent.spec).toContain("<!-- UNAPPROVED DRAFT -->");
+			expect(sent.user_turns.join(" ")).toContain("dry-run");
 			expect(h.execCalls).toEqual([]);
 			expect(await status(h)).toContain("spec checks on (notes sent=1)");
+		});
+
+		test("user turns reach Jev as typed and redacted, never case-folded", async () => {
+			// Key shapes are assembled at runtime so only the test process ever holds them whole.
+			const key = ["AKIA", "IOSFODNN7", "EXAMPLE"].join("");
+			const { h, dir } = await session({}, [userMsg(`Please call it dry-run. Key ${key} here.`)]);
+			writeSpec(dir, specText("call it dry-run"));
+			await written(h);
+			const judged = mockState.calls.filter((call) => "unfounded_decisions" in call.questions);
+			expect(judged).toHaveLength(1);
+			const turns = (judged[0].state as { user_turns: string[] }).user_turns.join("\n");
+			expect(turns).toContain("Please call it dry-run.");
+			expect(turns).not.toContain(key);
+			expect(turns).not.toContain(key.toLowerCase());
+			expect(turns).toContain("[REDACTED]");
+		});
+
+		test("a clean draft is judged once: the identical rewrite spends no second call", async () => {
+			const { h, dir } = await session({}, [userMsg("Please call it dry-run.")]);
+			writeSpec(dir, specText("call it dry-run"));
+			await written(h);
+			await written(h);
+			expect(notes(h)).toEqual([]);
+			expect(mockState.calls.filter((call) => "unfounded_decisions" in call.questions)).toHaveLength(1);
+		});
+
+		test("a failed judgment on a clean draft is retried on the next identical write", async () => {
+			const { h, dir } = await session({}, [userMsg("Please call it dry-run.")]);
+			writeSpec(dir, specText("call it dry-run"));
+			mockState.respond = () => {
+				throw new Error("Jev down");
+			};
+			await written(h);
+			await written(h);
+			expect(notes(h)).toEqual([]);
+			expect(mockState.calls.filter((call) => "unfounded_decisions" in call.questions)).toHaveLength(2);
 		});
 
 		// The reviewer sends a quiet note after a message or turn as `nextTurn` when the session is idle, so as not to wake it. The spec
@@ -3925,6 +4055,7 @@ describe("pipeline (omp-skills)", () => {
 			await toolResult(h, "write", "w5", { path: SPEC_REL, content: "x" }, "failed", { isError: true });
 			await toolResult(h, "bash", "w6", { command: `cat ${SPEC_REL}` });
 			expect(h.sent).toEqual([]);
+			expect(mockState.calls).toEqual([]);
 		});
 
 		test("edit and apply_patch results are checked too, by the path in their input", async () => {
@@ -3958,6 +4089,7 @@ describe("pipeline (omp-skills)", () => {
 			writeSpec(off.dir, specText("every route"));
 			await written(off.h);
 			expect(off.h.sent).toEqual([]);
+			expect(mockState.calls).toEqual([]);
 			expect(await status(off.h)).toContain("spec checks off (notes sent=0)");
 
 			const { h, dir } = await session();
@@ -3991,6 +4123,67 @@ describe("pipeline (omp-skills)", () => {
 			const out = await h.fire("tool_result", { toolName: "write", toolCallId: "w1", input: { path: SPEC_REL, content: "x" }, content: [{ type: "text", text: "ok" }], isError: false }, subCtx(h, [userMsg("sub task")]));
 			expect(out).toBeUndefined();
 			expect(h.sent).toEqual([]);
+			expect(mockState.calls).toEqual([]);
+		});
+
+		const specCalls = () => mockState.calls.filter((c) => "unfounded_decisions" in c.questions);
+		const both = (v: number): Answers => ({ unfounded_decisions: { type: "noul", noul: v }, vague_acceptance: { type: "noul", noul: v } });
+
+		test("a Jev finding joins the local problem in one note; a failed call leaves the local one alone", async () => {
+			mockState.respond = () => both(0.9);
+			const joined = await session();
+			writeSpec(joined.dir, specText("every route"));
+			await written(joined.h);
+			expect(notes(joined.h)).toHaveLength(1);
+			const { content } = notes(joined.h)[0].message;
+			expect(content).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="3"`);
+			expect(content).toContain("Jev could not base a locked decision");
+			expect(content).toContain("too vague to verify");
+
+			mockState.respond = () => {
+				throw new Error("Jev down");
+			};
+			const down = await session();
+			writeSpec(down.dir, specText("every route"));
+			await written(down.h);
+			expect(notes(down.h)).toHaveLength(1);
+			const { content: local } = notes(down.h)[0].message;
+			expect(local).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="1"`);
+			expect(local).not.toContain("Jev");
+		});
+
+		test("no spec judgment without grounding, a key or pipeline.jev; a table-shaped locked section is still judged", async () => {
+			mockState.respond = () => both(0.9);
+			// Only the model's words: nothing the user said grounds a judgment.
+			const ungrounded = await session({}, [asstMsg("drafting")]);
+			mockState.calls.length = 0;
+			writeSpec(ungrounded.dir, specText("call it dry-run"));
+			await written(ungrounded.h);
+			expect(specCalls()).toEqual([]);
+
+			mockState.apiKey = false;
+			const nokey = await session();
+			mockState.calls.length = 0;
+			writeSpec(nokey.dir, specText("every route"));
+			await written(nokey.h);
+			mockState.apiKey = true;
+			expect(specCalls()).toEqual([]);
+			expect(notes(nokey.h)).toHaveLength(1);
+			expect(notes(nokey.h)[0].message.content).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="1"`);
+
+			const off = await session({ pipeline: { jev: { enabled: false } } });
+			mockState.calls.length = 0;
+			writeSpec(off.dir, specText("every route"));
+			await written(off.h);
+			expect(specCalls()).toEqual([]);
+			expect(notes(off.h)).toHaveLength(1);
+			expect(notes(off.h)[0].message.content).toStartWith(`<pipeline-check spec="${SPEC_REL}" problems="1"`);
+
+			const table = await session();
+			mockState.calls.length = 0;
+			writeSpec(table.dir, specText("call it dry-run").replace(/^- Name it --dry-run .*$/m, "| Decision | Basis |\n|---|---|\n| Name it --dry-run | round 1 |"));
+			await written(table.h);
+			expect(specCalls()).toHaveLength(1);
 		});
 	});
 
@@ -4006,6 +4199,7 @@ describe("pipeline (omp-skills)", () => {
 		const flipSpec = { toolName: "edit", toolCallId: "f1", input: { path: SPEC_REL, old_string: "<!-- UNAPPROVED DRAFT -->", new_string: "<!-- APPROVED 2026-10-01 -->" } };
 		const REASON = "Approval needs the user's exact Approve answer from the ask tool.";
 		const guarded = { pipeline: { approvalGuard: true } };
+		const typedYes = askAnswer([], { customInput: "Yes, approve it" });
 
 		test("a flip with no answer behind it is blocked with the reason; it is off unless the config turns it on", async () => {
 			const on = setup(guarded, [...DRAFT], { hasUI: true });
@@ -4024,20 +4218,141 @@ describe("pipeline (omp-skills)", () => {
 		test("a real Approve answer after the draft lets it through; anything else does not", async () => {
 			const approved = setup(guarded, [...DRAFT, askAnswer(["Approve"])], { hasUI: true });
 			await approved.start();
+			mockState.calls.length = 0;
 			expect(await approved.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(mockState.calls).toEqual([]);
 
-			const notApproving: [string, unknown[]][] = [
-				["request changes", [askAnswer(["Request changes"])]],
-				["a cancelled ask", [result("ask", "Ask tool was cancelled by the user", { isError: true, details: {} })]],
-				["a typed answer", [askAnswer([], { customInput: "Approve" })]],
-				["a default picked on timeout", [askAnswer(["Approve"], { timedOut: true })]],
-				["an answer given before the draft was last written", [askAnswer(["Approve"]), ...DRAFT]],
+			const notApproving: [string, unknown[], number][] = [
+				["request changes", [askAnswer(["Request changes"])], 0],
+				["a cancelled ask", [result("ask", "Ask tool was cancelled by the user", { isError: true, details: {} })], 0],
+				["a typed answer", [askAnswer([], { customInput: "Approve" })], 1],
+				["a default picked on timeout", [askAnswer(["Approve"], { timedOut: true })], 0],
+				["an answer given before the draft was last written", [askAnswer(["Approve"]), ...DRAFT], 0],
+				["typed words, then a later pick", [typedYes, askAnswer(["Request changes"])], 0],
 			];
-			for (const [name, tail] of notApproving) {
+			for (const [name, tail, jevCalls] of notApproving) {
 				const h = setup(guarded, [...DRAFT, ...tail], { hasUI: true });
 				await h.start();
+				mockState.calls.length = 0;
 				expect((await h.fire("tool_call", flipSpec))?.block, name).toBe(true);
+				expect(mockState.calls, name).toHaveLength(jevCalls);
 			}
+		});
+
+		test("typed words plus a Jev grant let the flip through; a Jev error keeps the block", async () => {
+			const typedYes = result("ask", "User provided custom input:\nYes, approve it", {
+				details: { question: "Approve this spec?", options: ["Request changes", "Approve"], multi: false, selectedOptions: [], customInput: "Yes, approve it" },
+			});
+			mockState.respond = () => ({ approval_granted: { type: "noul", noul: 0.95 } });
+			const h = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await h.start();
+			mockState.calls.length = 0;
+			expect(await h.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(mockState.calls).toHaveLength(1);
+
+			mockState.respond = () => {
+				throw new Error("Jev down");
+			};
+			const failed = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await failed.start();
+			mockState.calls.length = 0;
+			expect(await failed.fire("tool_call", flipSpec)).toMatchObject({ block: true });
+		});
+
+		test("typed words make no Jev call without a key, with pipeline.jev off, or headless", async () => {
+			mockState.respond = () => ({ approval_granted: { type: "noul", noul: 0.99 } });
+			mockState.apiKey = false;
+			const nokey = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await nokey.start();
+			mockState.calls.length = 0;
+			expect(await nokey.fire("tool_call", flipSpec)).toEqual({ block: true, reason: REASON });
+			expect(mockState.calls).toEqual([]);
+			mockState.apiKey = true;
+
+			const off = setup({ pipeline: { approvalGuard: true, jev: { enabled: false } } }, [...DRAFT, typedYes], { hasUI: true });
+			await off.start();
+			mockState.calls.length = 0;
+			expect(await off.fire("tool_call", flipSpec)).toEqual({ block: true, reason: REASON });
+			expect(mockState.calls).toEqual([]);
+
+			const headless = setup(guarded, [...DRAFT, typedYes]);
+			await headless.start();
+			mockState.calls.length = 0;
+			expect(await headless.fire("tool_call", flipSpec)).toBeUndefined();
+			expect(await status(headless)).toContain("would block=1");
+			expect(mockState.calls).toEqual([]);
+		});
+
+		test("Jev sees the flip and every answer behind it, a timeout default marked as one", async () => {
+			mockState.respond = () => ({ approval_granted: { type: "noul", noul: 0.95 } });
+			const h = setup(
+				guarded,
+				[...DRAFT, askAnswer(["Approve"], { timedOut: true }), askAnswer(["Request changes"]), askAnswer([], { customInput: "ok, approve it now" })],
+				{ hasUI: true },
+			);
+			await h.start();
+			mockState.calls.length = 0;
+			expect(await h.fire("tool_call", flipSpec)).toBeUndefined();
+			const { artifact, target, exchanges }: { artifact: string; target: string; exchanges: string[] } = mockState.calls[0].state;
+			expect(artifact).toBe("spec");
+			expect(target).toBe(SPEC_REL);
+			expect(exchanges).toHaveLength(3);
+			expect(exchanges[0]).toContain("picked: Approve (auto-selected after timeout)");
+			expect(exchanges[1]).toContain("picked: Request changes");
+			expect(exchanges[1]).not.toContain("auto-selected");
+			expect(exchanges[2]).toContain('typed: "ok, approve it now"');
+		});
+
+		test("the default approvalFloor is inclusive", async () => {
+			mockState.respond = () => ({ approval_granted: { type: "noul", noul: 0.85 } });
+			const at = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await at.start();
+			expect(await at.fire("tool_call", flipSpec)).toBeUndefined();
+
+			mockState.respond = () => ({ approval_granted: { type: "noul", noul: 0.8499 } });
+			const below = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await below.start();
+			expect(await below.fire("tool_call", flipSpec)).toEqual({ block: true, reason: REASON });
+		});
+
+		test("a plan call that spends the shared budget leaves the approval flip blocked, with no second call", async () => {
+			const prdDraft = [assistant(call("write", { path: PRD_REL, content: '{ "approved": false }' })), result("write", "ok")];
+			const h = setup(guarded, [planMode(), ...prdDraft, typedYes], { hasUI: true });
+			await h.start();
+			const cellEvent = { toolName: "eval", toolCallId: "b1", input: { language: "py", code: `globals()["run_dag"](x)\napprove_file("${PRD_REL}")` } };
+			mockState.calls.length = 0;
+			mockState.respond = (c) =>
+				new Promise<Answers>((_, reject) => {
+					c.opts.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+				});
+			jest.useFakeTimers();
+			try {
+				const flush = async () => {
+					for (let i = 0; i < 20; i++) await Promise.resolve();
+				};
+				const pending = h.fire("tool_call", cellEvent);
+				await flush();
+				jest.advanceTimersByTime(10_000);
+				await flush();
+				expect(await pending).toEqual({ block: true, reason: REASON });
+				expect(mockState.calls).toHaveLength(1);
+			} finally {
+				jest.useRealTimers();
+			}
+		});
+
+		test("a Jev grant on one flip still checks the sibling flip", async () => {
+			const dagFlip = { toolName: "eval", toolCallId: "f3", input: { language: "py", code: `approve_file("${PRD_REL}")\napprove_file(".omp/pipeline/dag/login.json")` } };
+			const typedYes = result("ask", "User provided custom input:\nYes, approve both", {
+				details: { question: "Approve?", options: ["Request changes", "Approve"], multi: false, selectedOptions: [], customInput: "Yes, approve both" },
+			});
+			mockState.respond = (call: AskCall) =>
+				(call.state as { artifact: string }).artifact === "prd" ? { approval_granted: { type: "noul", noul: 0.95 } } : { approval_granted: { type: "noul", noul: 0.1 } };
+			const h = setup(guarded, [...DRAFT, typedYes], { hasUI: true });
+			await h.start();
+			mockState.calls.length = 0;
+			expect(await h.fire("tool_call", dagFlip)).toMatchObject({ block: true });
+			expect(mockState.calls).toHaveLength(2);
 		});
 
 		test("the PRD flag and approve_file are guarded the same way", async () => {
@@ -4141,8 +4456,11 @@ describe("pipeline (omp-skills)", () => {
 		const h = setup({}, []);
 		await h.start();
 		const text = await status(h);
-		expect(text).toContain("pipeline guards: plan guard on (blocked=0); approval guard off (blocked=0, would block=0)");
+		expect(text).toContain("pipeline guards: plan guard on (blocked=0); approval guard off (blocked=0, would block=0); jev on");
 		expect(text).toContain("pipeline checks: spec checks on (notes sent=0); skill-aware on (deep-interview,ralplan,dag)");
+		const off = setup({ pipeline: { jev: { enabled: false } } }, []);
+		await off.start();
+		expect(await status(off)).toContain("; jev off");
 		const none = setup({ pipeline: { skills: [] } }, []);
 		await none.start();
 		expect(await status(none)).toContain("skill-aware on (no skills)");

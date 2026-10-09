@@ -1,6 +1,6 @@
 {
   "name": "omp-typesafe",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "TypeSafe AI (Jev) adversarial and advisory reviewer, ambiguity gate and typesafe_ask tool for the omp coding agent",
   "license": "MIT",
   "author": "Abdullah Siddique",

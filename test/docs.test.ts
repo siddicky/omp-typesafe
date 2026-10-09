@@ -128,6 +128,10 @@ describe("README limits match the ones the code is tested against", () => {
 		expect(gate).toContain(`plan text so far (${LIMITS.planSoFar},`);
 		expect(gate).toContain(`up to ${LIMITS.userReplies}, ${LIMITS.replyChars} chars each`);
 		expect(tableRow(readme, "Stop gate")).toContain(`final assistant message (${LIMITS.stopGateMessage})`);
+		expect(tableRow(readme, "Pipeline plan guard")).toContain(`The Python eval cell (${LIMITS.planCellCode})`);
+		expect(tableRow(readme, "Pipeline spec check")).toContain(`The spec text (${LIMITS.specJevText})`);
+		expect(tableRow(readme, "Pipeline spec check")).toContain(`up to ${LIMITS.pipelineTurns}, ${LIMITS.pipelineTurnChars} chars each`);
+		expect(tableRow(readme, "Pipeline approval guard")).toContain(`up to ${LIMITS.pipelineTurns}, ${LIMITS.pipelineTurnChars} chars each`);
 	});
 
 	test("the per-prompt budgets, the dedupe window, the history bound and the evidence deadlines", () => {
@@ -341,12 +345,12 @@ describe("README documents the pipeline features", () => {
 	});
 
 	test("it says what none of the features does", () => {
-		expect(flat).toContain("None of them calls Jev, none sends anything off the machine, and none needs `TYPESAFE_API_KEY`");
+		expect(flat).toContain("Three of them take a Jev second opinion where their exact checks cannot decide (see [Jev second opinions](#jev-second-opinions)); skill awareness stays local.");
 		expect(flat).toContain("None of them approves, writes or runs anything on your behalf");
 		expect(flat).toContain("**It never approves anything.**");
 		expect(flat).toContain("**Not a sandbox.**");
-		expect(flat).toContain("All of them are dormant in [subagent sessions](#subagents), and each one fails open");
-		expect(readme).toContain("The [pipeline features](#pipeline-omp-skills) are not in this table: they make no request.");
+		expect(flat).toContain("All of them are dormant in [subagent sessions](#subagents). A guard that cannot read its call fails open: an error, an unreadable file or an input it does not recognize means the call goes ahead. A Jev call that fails keeps the safe default instead: the cell goes ahead, the spec note carries only the local problems, the flip stays blocked");
+		expect(readme).toContain("Skill awareness is not in this table: it makes no request.");
 	});
 
 	test("`/adversary status` has the two lines it says it has", () => {

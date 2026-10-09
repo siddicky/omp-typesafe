@@ -158,10 +158,18 @@ export function findDagCall(code: string): DagCall | null {
 }
 
 /** The Python source of an `eval` call's input, or null when it has none or the cell is in another language. */
-function pythonCode(input: unknown): string | null {
+export function pythonCode(input: unknown): string | null {
 	if (!isRecord(input) || typeof input.code !== "string") return null;
 	const language = typeof input.language === "string" ? input.language.trim() : "";
 	return language === "" || PYTHON_LANGUAGE.test(language) ? input.code : null;
+}
+
+/** The block reason when Jev, not the exact call finder, saw the dag run: it names the entry-point family, not the call. */
+export function planGuardJevReason(): string {
+	return (
+		"Jev judged this cell to start or stage a dag run (run_dag()/prepare_dag()), which cannot run in plan mode: dag workers are read-only there (no write, bash or eval), so every node would end blocked. " +
+		"Nothing was run. Ask the user to leave plan mode (Shift+Tab or /plan), then re-run the cell. Do not retry before they have."
+	);
 }
 
 /** The block reason: why, what was not done, and what the user does about it. */

@@ -370,6 +370,52 @@ export function findApprovalEvidence(entries: readonly ApprovalEntry[], labels: 
 	return unreadable >= 0 ? { status: "unrecognized", index: unreadable } : { status: "none", index: -1 };
 }
 
+/** Two flips for the same approval: the same artifact, granted the same way, at the same path by the same answers. */
+export function sameApprovalFlip(a: ApprovalFlip, b: ApprovalFlip): boolean {
+	return (
+		a.artifact === b.artifact &&
+		a.via === b.via &&
+		a.path === b.path &&
+		a.labels.length === b.labels.length &&
+		a.labels.every((label, i) => label === b.labels[i])
+	);
+}
+
+/** An entry recognizably from an ask result, even when it holds no answer (cancelled, error, redirect). */
+function isAskResult(entry: ApprovalEntry): boolean {
+	const message = entry.message;
+	return !!message && message.role === "toolResult" && message.toolName === "ask";
+}
+
+/**
+ * The readable ask answers behind a flip's latest draft write, one group per ask result, oldest
+ * first: the context a Jev second opinion judges, refusals included, so a typed word cannot win
+ * over a later explicit pick. A recognizable ask result without answers (cancelled, error, redirect)
+ * is an empty group: the user dismissed the question after answering, which vetoes the appeal.
+ * Unreadable shapes are skipped: with nothing to judge the flip stays failed open.
+ */
+export function flipAskEntries(entries: readonly ApprovalEntry[], flip: ApprovalFlip): AskAnswer[][] {
+	const from = lastDraftWrite(entries, flip) + 1;
+	const out: AskAnswer[][] = [];
+	for (let i = Math.max(0, from); i < entries.length; i++) {
+		const answers = askAnswers(entries[i]);
+		if (answers === null) continue;
+		if (answers.length > 0) out.push(answers);
+		else if (isAskResult(entries[i])) out.push([]);
+	}
+	return out;
+}
+
+/**
+ * May Jev judge these answers: the newest ask result holds words the user typed, not only picks, a
+ * timeout, or a timed-out pick. One ask result is one unit: typed words beside a pick still count,
+ * while a later result that only picks keeps the block without spending a call.
+ */
+export function isTypedAppeal(groups: readonly (readonly AskAnswer[])[]): boolean {
+	const newest = groups.at(-1) ?? [];
+	return newest.some((answer) => answer.customInput !== null && !answer.timedOut);
+}
+
 // ---- the decision -----------------------------------------------------------------------
 
 /** Code that writes a file or saves a plan: a cell that only reads one is not a draft. */
@@ -431,10 +477,18 @@ export interface ApprovalOptions {
  * `would_block` without an `ask` tool. An answer that predates the last revision approved text the user has not seen. A
  * branch or result shape this module cannot read, or any exception, allows the call.
  */
-export function decideApproval(toolName: string, input: unknown, entries: readonly ApprovalEntry[], options: ApprovalOptions): ApprovalDecision {
+export function decideApproval(
+	toolName: string,
+	input: unknown,
+	entries: readonly ApprovalEntry[],
+	options: ApprovalOptions,
+	granted: readonly ApprovalFlip[] = [],
+): ApprovalDecision {
 	try {
 		if (!Array.isArray(entries)) return { action: "allow", failedOpen: "the branch is unreadable" };
 		for (const flip of detectApprovalFlips(toolName, input)) {
+			// A flip a Jev second opinion already granted is approved: check the rest.
+			if (granted.some((done) => sameApprovalFlip(done, flip))) continue;
 			if (findApprovalEvidence(entries, flip.labels, lastDraftWrite(entries, flip) + 1).status !== "none") continue;
 			const reason = approvalBlockReason(flip.labels);
 			return options.askAvailable ? { action: "block", reason, flip } : { action: "would_block", reason, flip };

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { scanBranch } from "../../src/branch";
-import { APPROVAL_TOOLS, approvalBlockReason, askAnswers, decideApproval, detectApprovalFlips, findApprovalEvidence, type ApprovalArtifact, type ApprovalEntry, type ApprovalFlip, type ApprovalVia } from "../../src/pipeline/approval";
+import { APPROVAL_TOOLS, approvalBlockReason, askAnswers, decideApproval, detectApprovalFlips, findApprovalEvidence, flipAskEntries, isTypedAppeal, sameApprovalFlip, type ApprovalArtifact, type ApprovalEntry, type ApprovalFlip, type ApprovalVia } from "../../src/pipeline/approval";
 import { isRecord } from "../../src/text";
 
 type Raw = Record<string, unknown>;
@@ -706,6 +706,77 @@ describe("the approval scans stay linear on hostile text", () => {
 			// The note comes off before the timeout mark, which it follows.
 			expect(answers("Yes (auto-selected after timeout) (note: n)")).toMatchObject([{ selected: ["Yes"], timedOut: true }]);
 		});
+	});
+});
+
+describe("flipAskEntries and isTypedAppeal: the context and the trigger of the Jev second opinion", () => {
+	const SPEC_FLIP = flip("spec", "marker", SPEC, "Approve");
+	const typed = (customInput: string, extra: Raw = {}): Raw => ask(flat([], { customInput, ...extra }), `User provided custom input:\n${customInput}`);
+	const picked = (selected: string): Raw => ask(flat([selected]), `User selected: ${selected}`);
+
+	test("every readable answer behind the draft is context, grouped per ask result, refusals included", () => {
+		const branch = entries([writeDraft(), wrote(), typed("yes, once you rename it"), picked("Cancel")]);
+		expect(flipAskEntries(branch, SPEC_FLIP).map((group) => group.map((a) => a.customInput ?? a.selected.join(",")))).toEqual([["yes, once you rename it"], ["Cancel"]]);
+		expect(flipAskEntries(entries([writeDraft(), wrote()]), SPEC_FLIP)).toEqual([]);
+	});
+
+	test("one ask result is one unit: typed words beside a pick count, a later pure pick does not", () => {
+		const after = (tail: Raw[]) => flipAskEntries(entries([writeDraft(), wrote(), ...tail]), SPEC_FLIP);
+		expect(isTypedAppeal(after([typed("Yes, ship it")]))).toBe(true);
+		expect(isTypedAppeal(after([ask(flat(["Approve"], { customInput: "yes, and hurry" }), "User selected: Approve")]))).toBe(true);
+		// A later explicit refusal wins over the typed words: no judgment.
+		expect(isTypedAppeal(after([typed("yes, once you rename it"), picked("Cancel")]))).toBe(false);
+		expect(isTypedAppeal(after([picked("Request changes")]))).toBe(false);
+		expect(isTypedAppeal(after([approved()]))).toBe(false);
+		expect(isTypedAppeal(after([]))).toBe(false);
+	});
+
+	test("a timeout picked it, not the user: never a trigger", () => {
+		const timedOut = ask(flat([], { customInput: "Approve", timedOut: true }), "User selected: Approve (auto-selected after timeout)");
+		expect(isTypedAppeal(flipAskEntries(entries([writeDraft(), wrote(), timedOut]), SPEC_FLIP))).toBe(false);
+	});
+
+	test("answers from before the latest draft write are stale", () => {
+		expect(flipAskEntries(entries([typed("Yes"), writeDraft(), wrote()]), SPEC_FLIP)).toEqual([]);
+	});
+
+	test("an unreadable ask shape is skipped, not thrown on", () => {
+		const odd = result("ask", "", { somethingNew: true });
+		expect(flipAskEntries(entries([writeDraft(), wrote(), odd]), SPEC_FLIP)).toEqual([]);
+	});
+
+	test("a later cancelled ask vetoes the earlier typed words", () => {
+		const cancelled = ask({}, "Error: Cancelled by user", true);
+		const groups = flipAskEntries(entries([writeDraft(), wrote(), typed("Yes"), cancelled]), SPEC_FLIP);
+		expect(groups).toHaveLength(2);
+		expect(groups[1]).toEqual([]);
+		expect(isTypedAppeal(groups)).toBe(false);
+	});
+});
+
+describe("sameApprovalFlip and the granted exclusion", () => {
+	const SPEC_FLIP = flip("spec", "marker", SPEC, "Approve");
+
+	test("same artifact, via, path and labels; nothing less", () => {
+		expect(sameApprovalFlip(SPEC_FLIP, { ...SPEC_FLIP })).toBe(true);
+		expect(sameApprovalFlip(SPEC_FLIP, flip("spec", "marker", SPEC, "Run"))).toBe(false);
+		expect(sameApprovalFlip(SPEC_FLIP, flip("spec", "marker", ".omp/pipeline/specs/other.md", "Approve"))).toBe(false);
+		expect(sameApprovalFlip(SPEC_FLIP, flip("prd", "flag", ".omp/pipeline/prd.json", "Approve"))).toBe(false);
+	});
+
+	test("a granted flip is approved; a sibling flip still blocks until it is granted too", () => {
+		const branch: Raw[] = [];
+		const cell = { language: "py", code: `approve_file("${PRD}")\napprove_file(".omp/pipeline/dag/login.json")` };
+		const decided = (granted: ApprovalFlip[]) => decideApproval("eval", cell, entries(branch), { askAvailable: true }, granted);
+		const first = decided([]);
+		expect(first.action).toBe("block");
+		if (first.action !== "block") throw new Error("unreachable");
+		expect(first.flip.artifact).toBe("prd");
+		const second = decided([first.flip]);
+		expect(second.action).toBe("block");
+		if (second.action !== "block") throw new Error("unreachable");
+		expect(second.flip.artifact).toBe("dag");
+		expect(decided([first.flip, second.flip]).action).toBe("allow");
 	});
 });
 

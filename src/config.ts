@@ -49,8 +49,9 @@ export interface AmbiguityGateSettings {
 }
 
 /**
- * Features for the omp-skills pipeline (deep-interview -> spec, ralplan -> PRD, dag -> run). All of them are local:
- * none calls Jev, and none sends anything off the machine.
+ * Features for the omp-skills pipeline (deep-interview -> spec, ralplan -> PRD, dag -> run). Skill awareness is
+ * local; the guards and the spec check take a Jev second opinion where their exact checks cannot decide
+ * (see pipeline.jev), so only skillAware sends nothing off the machine.
  */
 export interface PipelineSettings {
 	/**
@@ -77,6 +78,24 @@ export interface PipelineSettings {
 	specChecks: boolean;
 	/** Block an approval (a spec's APPROVED marker, a PRD or DAG `approved: true`, `approve_file(`) the user never answered. Off by default: it blocks. */
 	approvalGuard: boolean;
+	/** Jev second opinions for the plan guard, the spec checks and the approval guard. */
+	jev: PipelineJevSettings;
+}
+
+/**
+ * The Jev second opinions for the plan guard, the spec checks and the approval guard: one floor per
+ * stake (a block, a note, a privilege override) and a shared per-call timeout. Skill awareness takes
+ * none: it routes turns, it judges nothing.
+ */
+export interface PipelineJevSettings {
+	enabled: boolean;
+	/** A plan-mode cell is blocked at or above this. */
+	planFloor: number;
+	/** A spec finding is noted at or above this. */
+	specFloor: number;
+	/** A blocked flip is allowed at or above this. */
+	approvalFloor: number;
+	timeoutMs: number;
 }
 
 /**
@@ -160,7 +179,14 @@ export const DEFAULT_CONFIG: TypesafeConfig = {
 		blockPropose: true,
 		timeoutMs: 2500,
 	},
-	pipeline: { planGuard: true, skillAware: true, skills: [...DEFAULT_PIPELINE_SKILLS], specChecks: true, approvalGuard: false },
+	pipeline: {
+		planGuard: true,
+		skillAware: true,
+		skills: [...DEFAULT_PIPELINE_SKILLS],
+		specChecks: true,
+		approvalGuard: false,
+		jev: { enabled: true, planFloor: 0.5, specFloor: 0.45, approvalFloor: 0.85, timeoutMs: 2500 },
+	},
 	compaction: {
 		enabled: true,
 		keepThreshold: 0.2,
@@ -227,7 +253,7 @@ export function subagentGuardEnabled(env: Env = process.env): boolean {
 
 /**
  * Apply TYPESAFE_ROLE / TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE / TYPESAFE_AMBIGUITY_THRESHOLD /
- * TYPESAFE_PIPELINE_GUARD on top of a merged config. Env wins over file. Values are trimmed and case-insensitive; anything
+ * TYPESAFE_PIPELINE_GUARD / TYPESAFE_PIPELINE_JEV on top of a merged config. Env wins over file. Values are trimmed and case-insensitive; anything
  * unrecognized is ignored with a warning instead of silently. TYPESAFE_SUBAGENT_GUARD is not applied (it is no
  * config value, see subagentGuardEnabled) but is checked here so that a typo is warned about at session start.
  * Pure function so it is independently testable; TYPESAFE_CONFIG is handled separately in
@@ -255,6 +281,11 @@ export function applyEnvOverrides(cfg: TypesafeConfig, env: Env = process.env, w
 	const planGuard = envBool("TYPESAFE_PIPELINE_GUARD", env.TYPESAFE_PIPELINE_GUARD, warn);
 	if (planGuard !== undefined) {
 		out = { ...out, pipeline: { ...out.pipeline, planGuard } };
+	}
+	// The kill switch for the pipeline Jev second opinions, which send text to TypeSafe.
+	const pipelineJev = envBool("TYPESAFE_PIPELINE_JEV", env.TYPESAFE_PIPELINE_JEV, warn);
+	if (pipelineJev !== undefined) {
+		out = { ...out, pipeline: { ...out.pipeline, jev: { ...out.pipeline.jev, enabled: pipelineJev } } };
 	}
 	const thresholdRaw = env.TYPESAFE_AMBIGUITY_THRESHOLD?.trim();
 	if (thresholdRaw) {
@@ -434,6 +465,7 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 	const pipe = (typeof o.pipeline === "object" && o.pipeline !== null ? o.pipeline : {}) as Record<string, unknown>;
 	const comp = (typeof o.compaction === "object" && o.compaction !== null ? o.compaction : {}) as Record<string, unknown>;
 	const ambWeights = (typeof amb.weights === "object" && amb.weights !== null ? amb.weights : {}) as Record<string, unknown>;
+	const pjev = (typeof pipe.jev === "object" && pipe.jev !== null ? pipe.jev : {}) as Record<string, unknown>;
 	const a = base.adversary;
 	const g = base.stopGate;
 	const ag = base.ambiguityGate;
@@ -499,6 +531,13 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 			skills: skillsArr(pipe.skills, pl.skills, warn),
 			specChecks: bool(pipe.specChecks, pl.specChecks),
 			approvalGuard: bool(pipe.approvalGuard, pl.approvalGuard),
+			jev: {
+				enabled: bool(pjev.enabled, pl.jev.enabled),
+				planFloor: num(pjev.planFloor, pl.jev.planFloor, 0, 1),
+				specFloor: num(pjev.specFloor, pl.jev.specFloor, 0, 1),
+				approvalFloor: num(pjev.approvalFloor, pl.jev.approvalFloor, 0, 1),
+				timeoutMs: Math.trunc(num(pjev.timeoutMs, pl.jev.timeoutMs, 250, 10_000)),
+			},
 		},
 		compaction: {
 			enabled: bool(comp.enabled, cm.enabled),
@@ -518,8 +557,8 @@ export function mergeConfig(base: TypesafeConfig, override: unknown, warn?: Warn
 
 /**
  * Config used when the file exists but cannot be read or parsed. Defaults would silently re-enable the
- * paid reviewers, and context compaction (which also sends the conversation to TypeSafe), for a user who had turned
- * them off, so they stay off until the file is fixed
+ * paid reviewers, the pipeline Jev second opinions, and context compaction (all of which send text to
+ * TypeSafe), for a user who had turned them off, so they stay off until the file is fixed
  * (TYPESAFE_REVIEW_ENABLED / TYPESAFE_AMBIGUITY_GATE can still turn the reviewers on).
  */
 function failClosed(base: TypesafeConfig): TypesafeConfig {
@@ -528,6 +567,7 @@ function failClosed(base: TypesafeConfig): TypesafeConfig {
 		adversary: { ...base.adversary, enabled: false },
 		stopGate: { ...base.stopGate, enabled: false },
 		ambiguityGate: { ...base.ambiguityGate, enabled: false },
+		pipeline: { ...base.pipeline, jev: { ...base.pipeline.jev, enabled: false } },
 		compaction: { ...base.compaction, enabled: false },
 	};
 }
@@ -553,7 +593,7 @@ export async function loadConfig(logger?: { warn?: (message: string) => void; in
 			next = base;
 		} else {
 			next = failClosed(base);
-			warn(`config at ${path} is unreadable (${err}); reviews and gates are off until it parses`);
+			warn(`config at ${path} is unreadable (${err}); reviews, gates, the pipeline second opinions and compaction are off until it parses`);
 		}
 	}
 	config = applyEnvOverrides(next, process.env, warn);

@@ -13,8 +13,9 @@ Delivery (which channel a note goes out on, when it steers, dedupe, budgets) is 
 the question battery and note wording differ. Review notes are advice: they never block a tool call. Two other
 pieces can intervene, and both are described below: the [ambiguity gate](#ambiguity-gate-plan-mode) can refuse
 a plan submission in plan mode until the user has been asked, and the optional [stop gate](#stop-gate) can ask
-the agent to keep going. For users of the [omp-skills](https://github.com/siddicky/omp-skills) pipeline, four local
-[pipeline features](#pipeline-omp-skills) make no Jev call; two of them can block a specific kind of tool call.
+the agent to keep going. For users of the [omp-skills](https://github.com/siddicky/omp-skills) pipeline, four
+[pipeline features](#pipeline-omp-skills) know the skills' artifacts; two of them can block a specific kind of tool
+call, and three take a Jev second opinion where their exact checks cannot decide.
 
 It also registers a `typesafe_ask` tool exposing all three TypeSafe primitives (noul, choice, score) for direct use.
 
@@ -187,7 +188,7 @@ the advisory role, so notes are countable per role after a run. Gate messages us
 | Content guard | A concern or blocker with no fired question and no classified defect or theme is dropped (`content_free`) rather than steering with an empty claim. |
 | `maxNotesPerUpdate` | At most this many non-blocker notes per model turn (blockers exempt). Inline notes count. |
 | `maxCallsPerTurn` | At most this many Jev calls per model turn (`call_budget`). |
-| Per-prompt budgets | At most 64 Jev calls (`prompt_budget`) and 12 message reviews per user prompt. Fixed, not configurable. |
+| Per-prompt budgets | At most 64 Jev calls (`prompt_budget`) and 12 message reviews per user prompt. Fixed, not configurable. The pipeline second opinions and the ambiguity gate sit outside this budget. |
 | `immuneTurns` | After a steer, further steers are downgraded for the rest of that model turn plus this many more. A turn is one model call. |
 
 `/adversary status` shows delivered, downgraded and suppressed counts by reason.
@@ -197,10 +198,10 @@ Within one user prompt, successful judgments of the exact same model, role, ques
 delivery, escalation and note budgets still run on every review. Reuse consumes no paid-call budget and records zero
 new usage. Failed requests are not cached, and a new prompt or session clears the judgment cache.
 
-An HTTP 402 pauses all TypeSafe dispatches for that API key and endpoint for 60 seconds, across reviews, compaction
-and explicit asks. Calls during the pause fail with the original error; they do not reach the provider. The next
-call after the pause retries normally. Changing credentials or endpoint, or resetting the client, permits immediate
-recovery. Other failures retain their existing retry behavior.
+An HTTP 402 pauses all TypeSafe dispatches for that API key and endpoint for 60 seconds, across reviews, the gates, the
+pipeline second opinions, compaction and explicit asks. Calls during the pause fail with the original error; they do
+not reach the provider. The next call after the pause retries normally. Changing credentials or endpoint, or resetting
+the client, permits immediate recovery. Other failures retain their existing retry behavior.
 
 ## Ambiguity gate (plan mode)
 
@@ -350,9 +351,9 @@ sessions, because omp had already pruned the region by then.
 
 [omp-skills](https://github.com/siddicky/omp-skills) turns a vague request into parallel, critic-gated work in three
 skills: `deep-interview` writes a spec (`.omp/pipeline/specs/<slug>.md`), `ralplan` a PRD (`.omp/pipeline/prd.json`), and
-`dag` runs that PRD from a Python `eval` cell (`run_dag()`, `agent()`). Four features here know about it. None of them
-calls Jev, none sends anything off the machine, and none needs `TYPESAFE_API_KEY`: they read the session branch, the tool
-call, and for the spec check the spec file on disk. None of them approves, writes or runs anything on your behalf.
+`dag` runs that PRD from a Python `eval` cell (`run_dag()`, `agent()`). Four features here know about it. Three of them
+take a Jev second opinion where their exact checks cannot decide (see [Jev second opinions](#jev-second-opinions));
+skill awareness stays local. None of them approves, writes or runs anything on your behalf.
 `/adversary status` has a `pipeline guards` and a `pipeline checks` line showing which are on and what they did.
 
 | Feature | Config key | Default | Acts on |
@@ -361,11 +362,13 @@ call, and for the spec check the spec file on disk. None of them approves, write
 | [Skill awareness](#skill-awareness) | `pipeline.skillAware`, `pipeline.skills` | on; `deep-interview`, `ralplan`, `dag` | `before_agent_start`, `turn_end`, `tool_call`, git evidence |
 | [Spec checks](#spec-checks) | `pipeline.specChecks` | on | `tool_result` for `write`, `edit`, `apply_patch` |
 | [Approval guard](#approval-guard) | `pipeline.approvalGuard` | **off** | `tool_call` for `write`, `edit`, `apply_patch`, `eval` |
+| [Jev second opinions](#jev-second-opinions) | `pipeline.jev` | on; floors 0.5 / 0.45 / 0.85; `timeoutMs` 2500 | plan-mode `eval` naming a dag runner, spec writes, approval flips |
 
-All of them are dormant in [subagent sessions](#subagents), and each one fails open: an error, an unreadable file or an
-input it does not recognize means the call goes ahead. The two guards are the only ones that can block a tool call; the
-reason they return is what the model sees as the tool's error. They are not part of the reviewer: `/adversary off`
-leaves them as they are, and each has its own config key.
+All of them are dormant in [subagent sessions](#subagents). A guard that cannot read its call fails open: an error, an
+unreadable file or an input it does not recognize means the call goes ahead. A Jev call that fails keeps the safe
+default instead: the cell goes ahead, the spec note carries only the local problems, the flip stays blocked. The two
+guards are the only ones that can block a tool call; the reason they return is what the model sees as the tool's error.
+They are not part of the reviewer: `/adversary off` leaves them as they are, and each has its own config key.
 
 ### Plan guard
 
@@ -382,12 +385,19 @@ run_dag() cannot run in plan mode: dag workers are read-only there (no write, ba
   branch wins. Under `--plan-yolo` the `plan-mode-context` message marks it, so the guard applies there too.
 - **A call** is `run_dag(` or `prepare_dag(` in running Python code, with or without a receiver, and inside an f-string
   field. The name in a comment, a string, a docstring or literal f-string text does not count, nor does a longer name
-  (`my_run_dag(`), a bare reference (`partial(run_dag, ...)`), an import, or a `def`. A call through a computed name
-  (`globals()["run_dag"](...)`) is not seen. Cells in another language never match.
+  (`my_run_dag(`), a bare reference (`partial(run_dag, ...)`), an import, or a `def`. The exact finder does not see a
+  call through a computed name (`globals()["run_dag"](...)`); with `pipeline.jev` such a cell goes to Jev (below). Cells
+  in another language never match.
 - **On by default, whether or not omp-skills is installed.** The guard does not look for the skills: it reads the cell. In
   plan mode it blocks any Python `eval` cell that calls `run_dag(` or `prepare_dag(`, including a function of that name
   from your own code or another library, and a block is a failed tool call the model has to work around. The skills are
   not a precondition. To turn it off, set `"pipeline": { "planGuard": false }` in `typesafe.json`.
+- **Jev second opinion.** With `pipeline.jev`, a plan-mode Python cell that names `run_dag`/`prepare_dag` without
+  calling it (an alias, a wrapper, a computed name) is still sent to Jev (`starts_dag_run`, the cell up to 3000 chars)
+  and blocks at or above `planFloor` with a reason that names the entry-point family instead of the call: it opens
+  `Jev judged this cell to start or stage a dag run (run_dag()/prepare_dag())` and goes on as the reason above. Cells
+  that never mention either name cost no call: `print(1)` stays local. Other languages and empty cells are never sent,
+  and without a key the finder stands alone. A call Jev cannot judge goes ahead.
 - **Kill switch.** `TYPESAFE_PIPELINE_GUARD=0` (also `false`, `off`, `no`) turns it off without touching the config
   file; it wins over `pipeline.planGuard`.
 
@@ -451,9 +461,14 @@ the [reviewer's rule](#delivery) for notes after a tool result: an aside is used
 ```
 
 It is advice: a quote that cannot be verified may predate a compaction, so the note asks the model to confirm it or move
-the decision under the unconfirmed assumptions. It never blocks anything, edits the tool result or calls Jev, works in
-headless runs, and is independent of `/adversary off` (`pipeline.specChecks: false` turns it off). A file that is not
-recognizably a spec, an approved spec, and a table-shaped locked-decisions section are left alone. Notes are custom
+the decision under the unconfirmed assumptions. It never blocks anything or edits the tool result, works in
+headless runs, and is independent of `/adversary off` (`pipeline.specChecks: false` turns it off). With `pipeline.jev`
+the draft (up to 8000 chars) and your turns (messages, skill invocations and ask answers: the latest skill invocation
+plus the newest, up to 8 of 400 chars each, as typed for the masker) also go to Jev, which adds at most two
+findings to the same note: an unfounded locked decision (`jev-unfounded`) and a vague criterion (`jev-vague`).
+Without a key, or with no user or skill words to ground the decisions, the local checks stand alone. A file that is not
+recognizably a spec and an approved spec are left alone, by the local check and by Jev; a table-shaped locked-decisions
+section is skipped by the local quote check, and Jev still reads the whole draft. Notes are custom
 messages of type `ai.typesafe.pipeline`.
 
 ### Approval guard
@@ -473,11 +488,47 @@ timed out, and not a question with a single option. A cancelled or failed `ask` 
 
 - **Headless** runs have no `ask` tool, so nothing is blocked: the flip is recorded as `would block` (a log line, and the
   count in `/adversary status`).
+- **Jev second opinion.** With `pipeline.jev`, a blocked flip whose newest ask result holds words you typed through
+  "Other" gets one more look (`approval_granted` at or above `approvalFloor`), even when that result also holds a pick
+  (a multi-question or multi-select ask): Jev sees the pick beside the words. It sees the flip and every readable
+  answer behind it (up to 8 exchanges of 400 chars each, refusals included and a pick omp made on a timeout marked as
+  one, so typed words cannot win over a later pick), and typed approval lets the flip through. Anything else keeps the
+  block, and a granted flip never smuggles a sibling: each flip of the call is judged on its own. A newest result
+  without typed words (only picks, a timeout default, a cancel), stale answers and unreadable shapes never start a
+  judgment, and without a key the exact check stands alone.
 - **It never approves anything.** It only refuses a flip that has no answer behind it.
 - **Not a sandbox.** It guards against honest mistakes. A `bash` command such as `sed -i`, or an `eval` cell that writes
   the marker or the flag itself, is not seen, and neither is a subagent's write. A compaction that drops the answer from
   the branch makes the next flip a block, and the model asks again. An `ask` result in a shape it does not recognize
   lets the flip through.
+
+### Jev second opinions
+
+The exact checks above are deliberately narrow: they never block or accuse on a guess. With `pipeline.jev` (on by
+default), what they cannot decide goes to Jev as one request each (two questions for a spec), fired at the floor for
+its stake (`planFloor` 0.5 to block a cell, `specFloor` 0.45 to note a finding, `approvalFloor` 0.85 to override a
+block), each call timed out by `pipeline.jev.timeoutMs` (2500 ms, at most 10000) with no retries. That timeout bounds
+one attempt; one hook's pipeline calls share a 10 s budget on top, so a many-flip call cannot stack timeouts past
+omp's fail-closed tool_call timeout — when the budget runs out the remaining flips stay blocked. A call that fails
+keeps the safe default: the cell goes ahead, the spec note carries only the local problems, the flip stays blocked.
+`pipeline.jev.enabled: false` (or `TYPESAFE_PIPELINE_JEV=0`) restores the exact checks alone, per feature switch
+unchanged. `/adversary status` shows the switch on its `pipeline guards` line. Everything sent is redacted when
+`adversary.redact` is on, like every other Jev call (see [What leaves your machine](#what-leaves-your-machine));
+user turns go out as typed, since folded text sails through the case-sensitive half of the masker.
+
+The spec judgment reads a draft once per content: an identical rewrite is deduped before any call, and a clean draft
+is remembered once Jev has answered it — a failed or ineligible judgment leaves no key, so the next identical write
+retries instead of remembering a clean it never saw. The plan judgment fires only for cells that name a dag runner; the
+approval judgment only when the newest answer is typed words. omp hands the hooks no cancel signal: each call is bounded
+by `timeoutMs`, and the plan and approval calls of one `tool_call` also by the shared 10 s budget, which aborts them;
+the spec judgment runs after the write (`tool_result`) and is bounded by `timeoutMs` alone. The pipeline calls sit
+outside the reviewer's per-prompt budgets, like the ambiguity gate's.
+
+Known limitations: pipeline Jev judgments are best-effort checks, not an authorization boundary. Approval question/answer
+lines are capped at 400 characters; a trailing withdrawal or condition can be lost before judgment. The local text
+fallback also discards notes beside selected options, so a conditional note can be treated as an unconditional pick.
+`pipeline.approvalGuard` remains off by default. The calibration corpus is synthetic and does not establish
+general accuracy; use explicit short approval choices and do not rely on these checks for permission enforcement.
 
 ## Subagents
 
@@ -587,7 +638,8 @@ profile (absent file = defaults):
     "skillAware": true,
     "skills": ["deep-interview", "ralplan", "dag"],
     "specChecks": true,
-    "approvalGuard": false
+    "approvalGuard": false,
+    "jev": { "enabled": true, "planFloor": 0.5, "specFloor": 0.45, "approvalFloor": 0.85, "timeoutMs": 2500 }
   },
   "compaction": {
     "enabled": true,
@@ -625,12 +677,13 @@ profile (absent file = defaults):
 | `ambiguityGate.*` | See [Ambiguity gate](#ambiguity-gate-plan-mode). The gate is eligible only while fewer than `maxAsksPerPlan` answers have been observed, so `0` keeps it silent. |
 | `pipeline.planGuard`, `skillAware`, `specChecks`, `approvalGuard` | One switch per [pipeline feature](#pipeline-omp-skills). Two of them can block a tool call: `planGuard`, which is on by default (with or without omp-skills installed; see [Plan guard](#plan-guard)), and `approvalGuard`, which is off. |
 | `pipeline.skills` | Skill names `skillAware` treats as pipeline skills. Case-sensitive, trimmed, each kept once. A bare name also matches that skill under any namespace (`dag` matches `omp-skills/dag`); a `<namespace>/<name>` entry matches only that one. `[]` recognizes none. An absent key, a non-array, or a list with nothing usable falls back to the default. |
+| `pipeline.jev` | Jev second opinions for the plan guard, the spec checks and the approval guard: `enabled`, one floor per stake (`planFloor` 0.5 to block, `specFloor` 0.45 to note, `approvalFloor` 0.85 to override, each 0 to 1), `timeoutMs` (250 to 10000 per call, no retries). Off, the exact local checks stand alone. |
 | `compaction.*` | See [Context compaction](#context-compaction). `keepThreshold` and `cacheCeiling` are 0 to 1, `rewriteGrowth` 0 to 10, `timeoutMs` 250 to 60000 per request to Jev (no retries). |
 
 Numeric values are clamped to their valid ranges, and unknown or mistyped values fall back to the default.
 If `typesafe.json` exists but cannot be read or parsed, the config fails closed: the reviewer, the stop gate, the
-ambiguity gate and context compaction are all off until the file parses, and a warning says why. The pipeline features cost nothing and
-keep their defaults. Config warnings (repairs, rejected
+ambiguity gate, the pipeline Jev second opinions and context compaction are all off until the file parses, and a
+warning says why. The exact pipeline checks cost nothing and keep their defaults. Config warnings (repairs, rejected
 environment values, a failed load) are shown as a notice at session start and on each session switch, and in
 `/adversary status`.
 
@@ -652,6 +705,7 @@ unrecognized value is ignored with a warning.
 | `TYPESAFE_AMBIGUITY_GATE` | Sets `ambiguityGate.enabled`. |
 | `TYPESAFE_AMBIGUITY_THRESHOLD` | A number from 0 to 1; overrides `ambiguityGate.threshold`. Anything else is ignored with a warning. |
 | `TYPESAFE_PIPELINE_GUARD` | Sets `pipeline.planGuard`: `0`, `false`, `off` or `no` is the kill switch for the [plan guard](#plan-guard), which blocks `run_dag(` in plan mode. |
+| `TYPESAFE_PIPELINE_JEV` | Sets `pipeline.jev.enabled`: `0`, `false`, `off` or `no` is the kill switch for the [pipeline Jev second opinions](#jev-second-opinions), which send text to TypeSafe. |
 | `TYPESAFE_DEFAULT_MODEL` | Model to use when the config file sets none. |
 | `TYPESAFE_BASE_URL` | API root for the SDK. Default `https://api.typesafe.ai`. |
 | `TYPESAFE_LOG_LEVEL` | Ignored by this extension: the SDK client is pinned to `warn` so a stray `debug` cannot print request bodies. SDK output goes to omp's logger. |
@@ -688,9 +742,13 @@ each capped:
 | Stop gate | The task, priorities and the final assistant message (2000) |
 | Context compaction | The conversation, in windows of about 60,000 characters: user and assistant text (abridged when a window is large; the goal is your last 3 prompts, 500 chars each), each tool call's name and input (1000 chars at most, less when a window is large), and for each result its status and size, never its output |
 | `typesafe_ask`, `/typesafe test` | Whatever state the model passes and the text of its questions (instructions, option and rubric descriptions), and a fixed probe |
+| Pipeline plan guard | The Python eval cell (3000) in plan mode |
+| Pipeline spec check | The spec text (8000) and your recent turns (up to 8, 400 chars each) |
+| Pipeline approval guard | The flip, its target, and your ask exchanges (questions, picks with timeout defaults marked, and typed replies — up to 8, 400 chars each) |
 
-The [pipeline features](#pipeline-omp-skills) are not in this table: they make no request. The spec check reads the spec
-file on disk, and the guards read the branch and the tool call, all in this process.
+Skill awareness is not in this table: it makes no request. The spec check reads the spec file on disk, and the guards
+read the branch and the tool call, all in this process; what the three Jev second opinions additionally send is in the
+rows above.
 
 So if the agent runs `cat .env`, edits a config holding a key, or prints a token in a test log, that text is in the
 tool result or diff that reaches TypeSafe. Two mitigations apply:
@@ -722,7 +780,8 @@ tool result or diff that reaches TypeSafe. Two mitigations apply:
   the session.
 
 Redaction is pattern matching, not a guarantee. A secret in an unusual format, and ordinary source code or
-prose, pass through unchanged. Do not rely on it for material you must not share; turn the reviewer off there.
+prose, pass through unchanged. Do not rely on it for material you must not share; turn the reviewer off there, and
+`pipeline.jev.enabled: false` for the pipeline second opinions (their exact checks stay local).
 
 ## Cost and latency
 
@@ -730,7 +789,9 @@ Jev is priced on input tokens only ($0.042 / Mtok at time of writing) and answer
 use `adversary.timeoutMs` with no retries, so a slow or unreachable API costs at most that much per review and
 never a failure. Gate evaluations use `ambiguityGate.timeoutMs` and the deadline above. The stop gate allows 4 s,
 `typesafe_ask` 10 s per attempt with two retries (about 40 s in all, cancellable), and `/typesafe test` 10 s per
-attempt with one retry, capped at 12 s. A 429 whose `Retry-After` is longer than 5 s fails at once as
+attempt with one retry, capped at 12 s. The pipeline second opinions allow `pipeline.jev.timeoutMs` (2.5 s) per call
+with no retries; the plan and approval calls of one `tool_call` share a 10 s budget, so a call that flips several
+approvals waits at most 10 s. A 429 whose `Retry-After` is longer than 5 s fails at once as
 `rate_limited` instead of being retried; a shorter one (or none) is waited out and retried, within the retry count
 and the call's own cap. `/adversary status` shows session token usage and estimated cost.
 
@@ -808,6 +869,7 @@ src/pipeline/plan-guard.ts  plan guard: blocks run_dag/prepare_dag eval cells in
 src/pipeline/skill.ts       skill prompts: parses the expanded and the raw /skill: shapes, tells pipeline skills
 src/pipeline/spec.ts        deep-interview spec checks: tolerant parser, user-quote corpus, <pipeline-check> note
 src/pipeline/approval.ts    approval guard: approval flips, ask-answer evidence, block or would-block decision
+src/pipeline/jev.ts         pipeline Jev second opinions: plan-cell, spec and approval judgments (states, questions, floors)
 src/vendor/fast-jev/        Jev scoring core vendored from tamaratran/fast-jev-compaction (MIT); UPSTREAM_COMMIT names the commit
 
 test/              bun test suites (src modules, index wiring, bench harness) with no network

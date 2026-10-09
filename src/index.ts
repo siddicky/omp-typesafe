@@ -27,11 +27,13 @@ import { captureBaseline, collectEvidence, collectStatus, recordAction, repoOutl
 import type { CollectOptions, Evidence } from "./evidence";
 import { claimedIntent, lastUserText, planModeActive, planSoFar, planStartIndex, priorActions, renderDelta, scanBranch, userTurnText } from "./branch";
 import type { EntryView } from "./branch";
-import { APPROVAL_TOOLS, decideApproval, detectApprovalFlips } from "./pipeline/approval";
-import { DAG_CALLS, planGuardDecision } from "./pipeline/plan-guard";
+import { APPROVAL_TOOLS, decideApproval, detectApprovalFlips, flipAskEntries, isTypedAppeal } from "./pipeline/approval";
+import type { ApprovalFlip } from "./pipeline/approval";
+import { DAG_CALLS, planGuardDecision, planGuardJevReason, pythonCode } from "./pipeline/plan-guard";
+import { formatAskAnswer, judgeApproval, judgePlanCell, judgeSpecText, PIPELINE_JEV_BUDGET_MS, PIPELINE_TURN_CHARS, PIPELINE_TURNS } from "./pipeline/jev";
 import { isPipelineSkill, latestUserTurnSkill, parseSkillPrompt } from "./pipeline/skill";
 import type { SkillInvocation } from "./pipeline/skill";
-import { buildQuoteCorpus, checkSpec, isSpecPath, renderSpecNote, SPEC_NOTE_CUSTOM_TYPE, specHash } from "./pipeline/spec";
+import { buildQuoteCorpus, checkSpec, isSpecPath, renderSpecNote, SPEC_NOTE_CUSTOM_TYPE, specHash, specJevTurns } from "./pipeline/spec";
 import {
 	beginPrompt,
 	beginTurn,
@@ -782,7 +784,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	};
 
 	// ---- pipeline (omp-skills) ---------------------------------------------------
-	// deep-interview -> a spec, ralplan -> a PRD, dag -> a run. Everything here is local: no Jev call, nothing sent.
+	// deep-interview -> a spec, ralplan -> a PRD, dag -> a run. Skill awareness is local; the guards and
+	// the spec check take a Jev second opinion when pipeline.jev is on (see pipeline/jev.ts).
 
 	/**
 	 * Is the current prompt a run of a pipeline skill, a turn the skill drives itself (its own interview, its own
@@ -807,46 +810,109 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	};
 
 	/**
-	 * What the pipeline guards say about one tool call: a block, or nothing. Each reads the branch and the input and
-	 * nothing else (no model, no network) and fails open, so a bug here can never stop a tool.
+	 * One ≤10 s Jev budget shared by a hook's pipeline judgments (the plan call plus every approval
+	 * flip), so a many-flip call cannot stack per-call timeouts past omp's fail-closed tool_call
+	 * timeout. An aborted call ends as unknown (null): the safe default for its feature.
 	 */
-	const pipelineGuard = (toolName: string, input: unknown, ctx: HostContext): ToolCallResult | undefined => {
+	const startPipelineBudget = (): { signal: AbortSignal; done: () => void } => {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), PIPELINE_JEV_BUDGET_MS);
+		return { signal: controller.signal, done: () => clearTimeout(timer) };
+	};
+
+	/**
+	 * A blocked flip the user may still have approved in typed ask words: ask Jev over every readable
+	 * answer behind the flip, refusals included, but only when the newest ask result holds typed words.
+	 * True only when Jev says granted; anything else keeps the block. Never throws: a block already
+	 * decided must not become an allow on a helper failure.
+	 */
+	const approvalJevAllows = async (entries: EntryView[], flip: ApprovalFlip, signal: AbortSignal): Promise<boolean> => {
+		const jev = getConfig().pipeline.jev;
+		if (!jev.enabled || !apiKeyPresent() || signal.aborted) return false;
+		try {
+			const groups = flipAskEntries(entries, flip);
+			if (!isTypedAppeal(groups)) return false;
+			const redact = redactOn();
+			const granted = await judgeApproval(flip, groups.flat().map((answer) => formatAskAnswer(answer, redact)), {
+				floor: jev.approvalFloor,
+				timeoutMs: jev.timeoutMs,
+				redact,
+				signal,
+			});
+			if (granted === null) logger?.debug?.("[typesafe] approval guard Jev gave no answer; the block stands");
+			return granted === true;
+		} catch {
+			return false;
+		}
+	};
+
+	/**
+	 * What the pipeline guards say about one tool call: a block, or nothing. The exact local checks run
+	 * first and need no key; a call they cannot decide goes to a Jev second opinion when pipeline.jev is
+	 * on. Everything fails open, so a bug here can never stop a tool.
+	 */
+	const pipelineGuard = async (toolName: string, input: unknown, ctx: HostContext): Promise<ToolCallResult | undefined> => {
 		const cfg = getConfig().pipeline;
 		let entries: EntryView[] | undefined;
 		const branch = (): EntryView[] => (entries ??= scanBranch(ctx.sessionManager.getBranch()));
+		// Armed by the first Jev judgment: most tool calls never reach one, so they never start a timer.
+		let budget: { signal: AbortSignal; done: () => void } | undefined;
+		const budgetSignal = (): AbortSignal => (budget ??= startPipelineBudget()).signal;
 		try {
-			// Scanning the branch costs more than looking for the two names, and most eval cells call neither.
-			const code = isRecord(input) && typeof input.code === "string" ? input.code : "";
-			if (cfg.planGuard && toolName === "eval" && DAG_CALLS.some((name) => code.includes(name))) {
-				const verdict = planGuardDecision(branch(), toolName, input, cfg);
-				if (verdict.block) {
-					planGuardBlocks += 1;
-					return { block: true, reason: verdict.reason };
+			try {
+				if (cfg.planGuard && toolName === "eval") {
+					const code = pythonCode(input);
+					// Most cells never name a dag runner; only those reach the branch scan and Jev. Split,
+					// uppercase or smuggled names stay invisible to both checks.
+					if (code !== null && code.trim() !== "" && DAG_CALLS.some((name) => code.includes(name)) && planModeActive(branch())) {
+						const verdict = planGuardDecision(branch(), toolName, input, cfg);
+						if (verdict.block) {
+							planGuardBlocks += 1;
+							return { block: true, reason: verdict.reason };
+						}
+						if (cfg.jev.enabled && apiKeyPresent()) {
+							const startsDag = await judgePlanCell(code, { floor: cfg.jev.planFloor, timeoutMs: cfg.jev.timeoutMs, redact: redactOn(), signal: budgetSignal() });
+							if (startsDag === true) {
+								planGuardBlocks += 1;
+								return { block: true, reason: planGuardJevReason() };
+							}
+							if (startsDag === null) logger?.debug?.("[typesafe] plan guard Jev gave no answer; the cell goes ahead");
+						}
+					}
 				}
+			} catch (err) {
+				logger?.warn?.(`[typesafe] plan guard failed: ${describeError(err)}`);
 			}
-		} catch (err) {
-			logger?.warn?.(`[typesafe] plan guard failed: ${describeError(err)}`);
-		}
-		try {
-			// Most writes approve nothing, and reading the input is cheaper than scanning the branch.
-			if (cfg.approvalGuard && APPROVAL_TOOLS.has(toolName) && detectApprovalFlips(toolName, input).length > 0) {
-				const decision = decideApproval(toolName, input, branch(), { askAvailable: askToolActive(ctx) });
-				if (decision.action === "block") {
-					approvalBlocks += 1;
-					return { block: true, reason: decision.reason };
+			try {
+				// Most writes approve nothing, and reading the input is cheaper than scanning the branch.
+				if (cfg.approvalGuard && APPROVAL_TOOLS.has(toolName) && detectApprovalFlips(toolName, input).length > 0) {
+					// One call can flip several approvals (two approve_file calls in one cell). A flip Jev
+					// grants is approved; the rest are decided again, so a grant never smuggles a sibling flip.
+					const granted: ApprovalFlip[] = [];
+					let decision = decideApproval(toolName, input, branch(), { askAvailable: askToolActive(ctx) }, granted);
+					while (decision.action === "block" && (await approvalJevAllows(branch(), decision.flip, budgetSignal()))) {
+						granted.push(decision.flip);
+						decision = decideApproval(toolName, input, branch(), { askAvailable: askToolActive(ctx) }, granted);
+					}
+					if (decision.action === "block") {
+						approvalBlocks += 1;
+						return { block: true, reason: decision.reason };
+					}
+					if (decision.action === "would_block") {
+						// No `ask` tool (a headless run): nobody could have answered, and nothing is stopped; it is only recorded.
+						approvalWouldBlocks += 1;
+						logger?.info?.(`[typesafe] would block ${decision.flip.artifact} approval (no ask tool): ${decision.reason}`);
+					} else if (decision.failedOpen) {
+						logger?.debug?.(`[typesafe] approval guard failed open: ${decision.failedOpen}`);
+					}
 				}
-				if (decision.action === "would_block") {
-					// No `ask` tool (a headless run): nobody could have answered, and nothing is stopped; it is only recorded.
-					approvalWouldBlocks += 1;
-					logger?.info?.(`[typesafe] would block ${decision.flip.artifact} approval (no ask tool): ${decision.reason}`);
-				} else if (decision.failedOpen) {
-					logger?.debug?.(`[typesafe] approval guard failed open: ${decision.failedOpen}`);
-				}
+			} catch (err) {
+				logger?.warn?.(`[typesafe] approval guard failed: ${describeError(err)}`);
 			}
-		} catch (err) {
-			logger?.warn?.(`[typesafe] approval guard failed: ${describeError(err)}`);
+			return undefined;
+		} finally {
+			budget?.done();
 		}
-		return undefined;
 	};
 
 	/**
@@ -862,10 +928,36 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			if (!target) return;
 			const abs = resolve(ctx.cwd ?? process.cwd(), target);
 			const text = await Bun.file(abs).text();
-			const check = checkSpec(text, buildQuoteCorpus(scanBranch(ctx.sessionManager.getBranch())));
 			const key = `${abs}\0${specHash(text)}`;
-			if (check.problems.length === 0 || specNoteKeys.has(key)) return;
-			const note = renderSpecNote(target, check.problems);
+			if (specNoteKeys.has(key)) return;
+			const scanned = scanBranch(ctx.sessionManager.getBranch());
+			const corpus = buildQuoteCorpus(scanned);
+			const check = checkSpec(text, corpus);
+			const problems = [...check.problems];
+			const grounded = corpus.sources.some((source) => source.kind === "user" || source.kind === "skill");
+			let judged = false;
+			if (check.status === "checked" && grounded) {
+				const jev = getConfig().pipeline.jev;
+				if (jev.enabled && apiKeyPresent()) {
+					const redact = redactOn();
+					// user_turns are raw (see specJevTurns): the corpus is case-folded and folded text sails
+					// through the case-sensitive half of the secret masker. An ask pick alone grounds nothing.
+					const turns = specJevTurns(scanned, PIPELINE_TURN_CHARS, PIPELINE_TURNS, redact);
+					const found = await judgeSpecText(text, turns, { floor: jev.specFloor, timeoutMs: jev.timeoutMs, redact });
+					if (found !== null) {
+						judged = true;
+						problems.push(...found);
+					}
+				}
+			}
+			if (problems.length === 0) {
+				// Clean under this content, once Jev has answered it: say nothing, and spend no second
+				// opinion on it again. An unknown or ineligible judgment leaves no key, so the next
+				// identical write retries (or re-checks locally) instead of remembering a clean it never saw.
+				if (judged) specNoteKeys.add(key);
+				return;
+			}
+			const note = renderSpecNote(target, problems);
 			if (note === null) return;
 			specNoteKeys.add(key);
 			// Only a note that went out is spent; a failed send may be retried by the next write of the same content.
@@ -909,8 +1001,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		try {
 			if (!isRecord(event)) return;
 			const toolName = typeof event.toolName === "string" ? event.toolName : "";
-			// Synchronous and local, so ahead of the gate's early returns (they would let an eval cell by) and its Jev call.
-			const blocked = pipelineGuard(toolName, event.input, ctx);
+			// Awaited ahead of the gate's early returns (they would let an eval cell by) and its Jev call.
+			const blocked = await pipelineGuard(toolName, event.input, ctx);
 			if (blocked) return blocked;
 			if (toolName !== "write" || !isProposeWrite(event.input)) return;
 			const entries = branchEntries(ctx);
@@ -1274,7 +1366,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 						return `ambiguity gate: ${state} (threshold ${fmt2(g.threshold)}); last ${fmt2(last.ambiguity)} trigger=${last.trigger} weakest=${last.weakest} gap=${last.gap} decision=${last.decision}; asks observed=${asksObserved()}`;
 					})(),
 					`subagent guard: ${subagentGuardEnabled() ? "on" : "off (TYPESAFE_SUBAGENT_GUARD)"}; subagent sessions skipped=${subagents.sessions} (hook calls skipped=${subagents.hookCalls})`,
-					`pipeline guards: plan guard ${onOff(p.planGuard)} (blocked=${planGuardBlocks}); approval guard ${onOff(p.approvalGuard)} (blocked=${approvalBlocks}, would block=${approvalWouldBlocks})`,
+					`pipeline guards: plan guard ${onOff(p.planGuard)} (blocked=${planGuardBlocks}); approval guard ${onOff(p.approvalGuard)} (blocked=${approvalBlocks}, would block=${approvalWouldBlocks}); jev ${onOff(p.jev.enabled)}`,
 					`pipeline checks: spec checks ${onOff(p.specChecks)} (notes sent=${specNotesSent}); skill-aware ${onOff(p.skillAware)} (${p.skills.length > 0 ? p.skills.join(",") : "no skills"})`,
 				];
 				if (warnings.length > 0) lines.push(`config warnings: ${warnings.join(" | ")}`);

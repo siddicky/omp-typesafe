@@ -8,6 +8,7 @@ import {
 	normalizeQuote,
 	parseSpec,
 	quoteVerified,
+	specJevTurns,
 	readMarker,
 	renderSpecNote,
 	SPEC_NOTE_CUSTOM_TYPE,
@@ -424,6 +425,78 @@ describe("buildQuoteCorpus", () => {
 	test("skips empty turns", () => {
 		expect(kinds([user(""), user("   \n"), { type: "message", message: { role: "user", content: [] } }])).toEqual([]);
 		expect(buildQuoteCorpus([])).toEqual({ sources: [] });
+	});
+});
+
+describe("specJevTurns", () => {
+	// Key shapes are assembled at runtime so only the test process ever holds them whole.
+	const awsKey = () => ["AKIA", "IOSFODNN7", "EXAMPLE"].join("");
+	const bearerToken = () => "Bearer " + "abc123".repeat(3);
+	const turns = (entries: Raw[], max = 8) => specJevTurns(scanBranch(entries), 400, max, false);
+	const sent = (entries: Raw[], redact: boolean) => specJevTurns(scanBranch(entries), 400, 8, redact).join("\n");
+
+	test("keeps the user's words as typed, not case-folded", () => {
+		expect(sent([user("Please call it Dry-Run.")], false)).toBe("Please call it Dry-Run.");
+	});
+
+	test("redacts secrets that the folded corpus would sail through the masker with", () => {
+		const text = sent([user(`use ${awsKey()} and ${bearerToken()} here`)], true);
+		expect(text).not.toContain(awsKey());
+		expect(text).not.toContain(bearerToken().slice("Bearer ".length));
+		expect(text).toContain("[REDACTED]");
+		// The folded corpus text is what must never be sent: the key shapes do not survive folding.
+		const folded = buildQuoteCorpus(scanBranch([user(`use ${awsKey()} here`)])).sources[0].text;
+		expect(folded).toContain(awsKey().toLowerCase());
+	});
+
+	test("one slot per entry: a skill's args and prompt collapse to the prompt", () => {
+		const slots = turns([skillPrompt(REQUEST)]);
+		expect(slots).toHaveLength(1);
+		expect(slots[0]).toContain("/skill:deep-interview");
+		expect(slots[0]).toContain("sqlite-backed");
+	});
+
+	test("a long history keeps the latest skill invocation plus the newest turns", () => {
+		const branch: Raw[] = [user("turn 0"), user("turn 1"), skillPrompt(REQUEST)];
+		for (let i = 3; i < 10; i++) branch.push(user(`turn ${i}`));
+		const slots = turns(branch);
+		expect(slots).toHaveLength(8);
+		expect(slots[0]).toContain("/skill:deep-interview");
+		expect(slots.at(-1)).toBe("turn 9");
+		expect(slots.join("\n")).not.toContain("turn 0");
+		expect(slots.join("\n")).not.toContain("turn 1");
+	});
+
+	test("a late skill re-invocation keeps its context: the window fills from before it", () => {
+		const branch: Raw[] = [];
+		for (let i = 0; i < 8; i++) branch.push(user(`turn ${i}`));
+		branch.push(skillPrompt(REQUEST));
+		const slots = turns(branch);
+		expect(slots).toHaveLength(8);
+		expect(slots.at(-1)).toContain("/skill:deep-interview");
+		expect(slots[0]).toBe("turn 1");
+	});
+
+	test("a window of one is the opener, or the newest turn without a skill", () => {
+		const branch: Raw[] = [user("turn 0"), user("turn 1"), skillPrompt(REQUEST), user("turn 3")];
+		const anchored = turns(branch, 1);
+		expect(anchored).toHaveLength(1);
+		expect(anchored[0]).toContain("/skill:deep-interview");
+		expect(turns([user("turn 0"), user("turn 1")], 1)).toEqual(["turn 1"]);
+	});
+
+	test("without a skill turn it is the newest turns; short histories pass through whole", () => {
+		const branch: Raw[] = [];
+		for (let i = 0; i < 12; i++) branch.push(user(`turn ${i}`));
+		const slots = turns(branch);
+		expect(slots).toHaveLength(8);
+		expect(slots[0]).toBe("turn 4");
+		expect(turns([user("a"), user("b")])).toEqual(["a", "b"]);
+	});
+
+	test("blank turns take no slot, and each slot is capped", () => {
+		expect(turns([user("   "), user("kept")])).toEqual(["kept"]);
+		expect(turns([user("x".repeat(1000))])[0]).toHaveLength(400);
 	});
 });
 

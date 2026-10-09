@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { cap, escapeAttr, isRecord, stripControl } from "../text";
+import { cap, escapeAttr, isRecord, maskedCap, stripControl } from "../text";
 
 /**
  * Deterministic checks of a deep-interview spec (`.omp/pipeline/specs/<slug>.md`; the format is pinned by omp-skills'
@@ -484,6 +484,60 @@ export function buildQuoteCorpus(entries: readonly CorpusEntry[]): QuoteCorpus {
 	return { sources };
 }
 
+type RawTurnKind = "user" | "skill" | "ask";
+
+interface RawTurnGroup {
+	kind: RawTurnKind;
+	texts: string[];
+}
+
+/** The user's words per branch entry, unfolded: a user message, a skill's args and prompt, an ask's answers. */
+function turnGroups(entries: readonly CorpusEntry[]): RawTurnGroup[] {
+	const out: RawTurnGroup[] = [];
+	for (const entry of entries) {
+		const message = entry.message;
+		if (entry.type === "message" && message) {
+			if (message.role === "user") out.push({ kind: "user", texts: [message.text] });
+			else if (message.role === "toolResult" && message.toolName === "ask" && message.isError !== true) {
+				const answers = askAnswers(message);
+				if (answers.length > 0) out.push({ kind: "ask", texts: answers });
+			}
+		} else if (entry.type === "custom_message" && entry.customType === SKILL_PROMPT) {
+			const texts = skillTexts(entry);
+			if (texts.length > 0) out.push({ kind: "skill", texts });
+		}
+	}
+	return out;
+}
+
+function longest(texts: readonly string[]): string {
+	return texts.reduce((a, b) => (b.length > a.length ? b : a));
+}
+
+/**
+ * Turns for a spec judgment: one slot per entry (a skill's args and prompt collapse to the longest:
+ * the prompt holds the args), masked and capped, anchored at the latest skill invocation with the
+ * newest turns filling a window of maxTurns (at least 1). Short histories pass through whole. Jev
+ * state must come from these unfolded turns, not the corpus: the masker is partly case-sensitive.
+ */
+export function specJevTurns(entries: readonly CorpusEntry[], maxChars: number, maxTurns: number, redact: boolean): string[] {
+	const window = Math.max(1, Math.trunc(maxTurns));
+	const slots = turnGroups(entries)
+		.map((group) => ({ kind: group.kind, text: maskedCap(longest(group.texts), maxChars, redact) }))
+		.filter((slot) => slot.text.trim().length > 0);
+	if (slots.length <= window) return slots.map((slot) => slot.text);
+	const opener = slots.filter((slot) => slot.kind === "skill").at(-1);
+	if (opener === undefined) return slots.slice(-window).map((slot) => slot.text);
+	if (window === 1) return [opener.text];
+	// The anchor plus the newest turns around it, oldest first: turns after the anchor first, then
+	// the newest from before it to fill the window. A late skill re-invocation keeps its context.
+	const idx = slots.lastIndexOf(opener);
+	const after = slots.slice(idx + 1).slice(-(window - 1));
+	const room = window - 1 - after.length;
+	const before = room > 0 ? slots.slice(0, idx).slice(-room) : [];
+	return [...before, opener, ...after].map((slot) => slot.text);
+}
+
 /** Does the quote appear, verbatim up to normalizeQuote, in one of the corpus's sources? A quote with no words does not. */
 export function quoteVerified(quote: string, corpus: QuoteCorpus): boolean {
 	const fragments = quoteFragments(quote);
@@ -505,7 +559,11 @@ export type SpecProblemCode =
 	/** A locked decision cites no usable quote. */
 	| "quote-missing"
 	/** A cited quote is not in anything the user said. */
-	| "quote-unverified";
+	| "quote-unverified"
+	/** Jev could not base a locked decision on anything the user said. */
+	| "jev-unfounded"
+	/** Jev found an acceptance criterion too vague to verify. */
+	| "jev-vague";
 
 export interface SpecProblem {
 	code: SpecProblemCode;
@@ -630,7 +688,7 @@ export function renderSpecNote(specPath: string, problems: readonly SpecProblem[
 	if (problems.length > MAX_LISTED) listed.push(`- and ${problems.length - MAX_LISTED} more`);
 	return (
 		`<pipeline-check spec="${escapeAttr(specPath)}" problems="${problems.length}" guidance="advisory; weigh, don't blindly obey">\n` +
-		`Deterministic checks of this deep-interview draft found ${problems.length === 1 ? "1 problem" : `${problems.length} problems`}. ` +
+		`Checks of this deep-interview draft found ${problems.length === 1 ? "1 problem" : `${problems.length} problems`}. ` +
 		`Fix them in the spec file before you ask the user to approve it. A quote that cannot be verified may come from before a compaction: ` +
 		`confirm it, or move that decision under the unconfirmed assumptions.\n` +
 		`${listed.join("\n")}\n` +

@@ -68,6 +68,17 @@ export const LIMITS = {
 	choiceOptionsMax: 255,
 	scoreLevelsMin: 2,
 	scoreLevelsMax: 10,
+	// Pipeline Jev judgments
+	/** Whole-hook budget shared by one tool_call's pipeline Jev judgments. */
+	pipelineHookBudgetMs: 10_000,
+	/** The Python eval cell sent for a plan-guard judgment. */
+	planCellCode: 3000,
+	/** The spec text sent for a spec judgment. */
+	specJevText: 8000,
+	/** User turns (spec) or ask exchanges (approval) sent per judgment. */
+	pipelineTurns: 8,
+	/** Chars kept per turn or exchange. */
+	pipelineTurnChars: 400,
 	// Budgets
 	callsPerPrompt: 64,
 	messageReviewsPerPrompt: 12,

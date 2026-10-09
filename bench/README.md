@@ -55,6 +55,8 @@ bench/
   run.ts          matrix runner, plus --regrade
   grade-plan.ts   plan-side grading (Jev checklist, LLM judge), plus --rescore
   report.ts       aggregate runs.jsonl -> report.md
+  calibrate-jev.ts  scores the pipeline Jev judges against the live API (see "Calibrating the pipeline Jev judges")
+  jev-calibration/  its labelled corpus (cases.ts) and floor math (floor.ts)
   results/        one directory per run, created at run time; not committed
 ```
 
@@ -355,6 +357,30 @@ sessions (task-tool and eval-agent workers, isolated ones included) the extensio
 session last started or switched (plan approval counts as a switch, so a plan cell shows only the workers spawned
 after approval): only the main session is reviewed and only it writes the dump, so a cell whose agent spawns workers
 shows them here and nowhere else. Older dumps lack it.
+
+## Calibrating the pipeline Jev judges
+
+The three pipeline second opinions (`src/pipeline/jev.ts`: the plan guard, the spec checks, the approval guard) fire
+at the floors `pipeline.jev.planFloor`, `specFloor` and `approvalFloor`. `bench/calibrate-jev.ts` measures them
+against the live API, with the production state and questions (redaction on) of a labelled corpus
+(`bench/jev-calibration/cases.ts`: 30 plan cells, 20 specs, 48 approval flips, each split into tune and holdout):
+
+```sh
+bun bench/calibrate-jev.ts [--judge plan|spec|approval|all] [--samples 3] [--concurrency 4] [--model NAME] [--out PATH]
+```
+
+It spends API credits and is not part of `bun test`. It prints one table per question (min–max over the samples,
+and whether the case lands right at the shipped floor), `spread > 0.15` warnings, and a summary line per judge. The
+target per judge, at the shipped default floor, is zero false fires on the clear negatives and at least 90% of the
+clear positives firing (an abstention counts as not fired, as in production); `recommended` is the grid floor
+(0.05 steps, not below 0.60 approval, 0.50 plan, 0.30 spec) with the widest margin on the tune split only. The
+exit code is 0 when every selected judge meets the target, 1 when one misses, 2 on a usage, corpus, key or request
+failure. Per-case scores go to `bench/results/jev-calibration-<timestamp>.json`.
+
+Re-run it after changing a Jev question or state in `src/pipeline/jev.ts`, a floor in `src/config.ts`, or the model.
+Change the prompt or state first and the floor second; judge the result on the holdout split too. The floor math and
+the corpus's reachability (production would send every case) are covered offline by
+`test/bench/jev-calibration.test.ts`.
 
 ## Tests
 
